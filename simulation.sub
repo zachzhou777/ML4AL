@@ -1,0 +1,16 @@
+executable = run_job.sh
+arguments = $(Process)
+
+log = simulation$(Process).log
+output = simulation$(Process).out
+error = simulation$(Process).err
+
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+transfer_input_files = run_job.py, simulation.py, simulation.pkl, settings$(Process).csv, http://proxy.chtc.wisc.edu/SQUID/zzhou246/sim-env.tar.gz
+
+request_cpus = 1
+request_memory = 8GB
+request_disk = 8GB
+
+queue 100
