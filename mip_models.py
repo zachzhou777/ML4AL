@@ -4,7 +4,7 @@ import gurobipy as gp
 from gurobipy import GRB
 from gurobi_ml.torch import add_sequential_constr
 from ems_data import EMSData
-from multilabel_mlp import MultilabelMLP
+from neural_network import MLP
 
 def compute_coverage(data: EMSData):
     """Compute the `coverage` parameter for MEXCLP.
@@ -95,8 +95,9 @@ def mexclp(
 
 def mexclp_mlp(
         demand: list[float],
-        mlp: MultilabelMLP,
+        mlp: MLP,
         n_ambulances: int,
+        extra_constraints: tuple[np.ndarray, np.ndarray] = None,
         use_gurobi_ml: bool = False,
         scale_relu: bool = False,
         warm_start: list[int] = None,
@@ -110,11 +111,14 @@ def mexclp_mlp(
     demand : list[float]
         Weight of each demand node.
     
-    mlp : MultilabelMLP
+    mlp : MLP
         MLP predicting coverage probabilities given a solution.
     
     n_ambulances : int
         Total number of ambulances.
+    
+    extra_constraints : tuple(np.ndarray, np.ndarray), optional
+        Extra constraints on x of the form Ax <= b. Given as a tuple (A, b).
     
     use_gurobi_ml : bool, optional
         Use the Gurobi Machine Learning package to embed the MLP in the MIP model.
@@ -150,13 +154,17 @@ def mexclp_mlp(
     model.Params.LogToConsole = verbose
 
     x = model.addMVar(layer_dims[0], lb=0, ub=n_ambulances, vtype=GRB.INTEGER)
-    y = model.addMVar(layer_dims[-1], lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS)
+    y = model.addMVar(layer_dims[-1], lb=-GRB.INFINITY, ub=1.0, vtype=GRB.CONTINUOUS)
 
     demand = np.array(demand)
     model.setObjective(demand@y, GRB.MAXIMIZE)
 
     model.addConstr(x.sum() <= n_ambulances)
 
+    if extra_constraints is not None:
+        A, b = extra_constraints
+        model.addConstr(A@x <= b)
+    
     if use_gurobi_ml:
         # Ideally we would pass mlp directly to add_sequential_constr, but it doesn't like Dropout layers
         sequential_model = nn.Sequential(*(layer for layer in mlp if not isinstance(layer, nn.Dropout)))

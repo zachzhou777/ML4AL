@@ -32,7 +32,7 @@ class Simulation:
     data : EMSData
         Data for the simulation.
     
-    avg_calls_per_day : int, optional
+    avg_calls_per_day : int
         Average number of calls per day.
     
     n_days : int, optional
@@ -82,7 +82,7 @@ class Simulation:
     def __init__(
         self,
         data: 'EMSData',
-        avg_calls_per_day: int = 100,
+        avg_calls_per_day: int,
         n_days: int = 100,
         n_replications: int = 10
     ):

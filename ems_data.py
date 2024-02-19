@@ -5,17 +5,21 @@ import pickle
 import numpy as np
 import pandas as pd
 from pyproj import Proj
+from tqdm import tqdm, trange
+
+# TODO: Not really sure if this is the best place for these constants
+# Toronto (region_id=1) data
+# Source: https://www.toronto.ca/wp-content/uploads/2021/04/9765-Annual-Report-2020-web-final-compressed.pdf
+TORONTO_N_AMBULANCES = 234
+TORONTO_AVG_CALLS_PER_DAY = 194109/365
 
 class EMSData:
     """Class to read and preprocess EMS data for usage in simulation and MIP models.
 
     Parameters
     ----------
-    urbanicity : str, optional
-        Either 'Urban' or 'Rural'.
-    
-    region_id : int, optional
-        1 is urban, 4 is rural, Eric has data for others if needed. TODO merge with urbanicity?
+    region_id : int
+        One of 1, 2, 3, 4, 5, 6, 9, or 14.
     
     x_intervals : int, optional
         Number of grid intervals along the x-axis. Grid is used to define demand nodes.
@@ -23,25 +27,19 @@ class EMSData:
     y_intervals : int, optional
         Number of grid intervals along the y-axis. Grid is used to define demand nodes.
     
-    station_limit : int, optional
-        Maximum number of stations. Sample a subset if needed.
-    
-    hospital_limit : int, optional
-        Maximum number of hospitals. Sample a subset if needed.
-    
-    clinic_limit : int, optional
-        Maximum number of clinics. Sample a subset if needed.
+    use_clinics : bool, optional
+        Whether patients can be transported to clinics in addition to hospitals.
     
     data_dir : str, optional
         Directory containing data files.
     
+    verbose : bool, optional
+        Whether to print progress bars.
+    
     Attributes
     ----------
-    urbanicity : str
-        Either 'Urban' or 'Rural'.
-    
     region_id : int
-        1 is urban, 4 is rural.
+        One of 1, 2, 3, 4, 5, 6, 9, or 14.
     
     x_intervals : int
         Number of grid intervals along the x-axis. Grid is used to define demand nodes.
@@ -51,6 +49,9 @@ class EMSData:
     
     data_dir : str
         Directory containing data files.
+    
+    urbanicity : str
+        Either 'Urban' or 'Rural'. Determined by region_id.
     
     response_time_threshold : float
         Response time threshold in minutes. Set to 9.0 for urban and 20.0 for rural.
@@ -100,39 +101,42 @@ class EMSData:
     """
     def __init__(
         self,
-        urbanicity: str = 'Rural',
-        region_id: int = 4,
+        region_id: int,
         x_intervals: int = 10,
         y_intervals: int = 10,
-        station_limit: int = 10,
-        hospital_limit: int = 10,
-        clinic_limit: int = 0,
-        data_dir: str = 'data'
+        use_clinics: bool = False,
+        data_dir: str = 'data',
+        verbose: bool = False
     ):
-        self.urbanicity = urbanicity
         self.region_id = region_id
         self.x_intervals = x_intervals
         self.y_intervals = y_intervals
         self.data_dir = data_dir
-
+        # TODO remaining regions
+        region2urbanicity = {
+            1: 'Urban',
+            4: 'Rural'
+        }
+        self.urbanicity = region2urbanicity[region_id]
+        # TODO allow user to set response_time_threshold
         urbanicity2rtt = {
             'Urban': 9.0,
             'Rural': 20.0
         }
-        self.response_time_threshold = urbanicity2rtt[urbanicity]
+        self.response_time_threshold = urbanicity2rtt[self.urbanicity]
         self.patients = self._read_patient_location_data()
-        self.stations = self._read_station_data(station_limit)
-        self.hospitals = self._read_hospital_data(hospital_limit, clinic_limit)
+        self.stations = self._read_station_data()
+        self.hospitals = self._read_hospital_data(use_clinics)
         (self.demand_nodes,
          self.patients['demand_node']) = self._define_demand_nodes()
-        self.patients['hospital'] = self._assign_patients_to_hospitals()
+        self.patients['hospital'] = self._assign_patients_to_hospitals(verbose)
         self.times = self._read_time_data()
         self.nonemergent_scale = self._compute_nonemergent_scale()
         self.support_times = self._compute_support_times()
         self.arrival_times = self._compute_arrival_times()
         (self.average_response_times,
          self.average_transport_times,
-         self.average_return_times) = self._compute_travel_times()
+         self.average_return_times) = self._compute_travel_times(verbose)
         self.dispatch_order = self._determine_dispatch_order()
     
     def save_instance(self, filename: str):
@@ -156,30 +160,18 @@ class EMSData:
         patients = patients[['x', 'y']]
         return patients
     
-    def _read_station_data(self, station_limit: int) -> pd.DataFrame:
-        """Read station (a.k.a. base) data. Sample a subset of stations if there are too many."""
+    def _read_station_data(self) -> pd.DataFrame:
+        """Read station (a.k.a. base) data."""
         stations = pd.read_csv(os.path.join(self.data_dir, 'Base_Locations.csv'))
-        stations = stations[stations['Type'] == 'E']
+        # Type values: E = EMS, F = Fire, P = Police
+        stations = stations[(stations['Type'] == 'E') & (stations['Region'] == self.region_id)]
         stations = stations[['Easting', 'Northing']]
         stations.columns = ['x', 'y']
-
-        # Only consider stations within box defined by patient locations
-        x_min, x_max = self.patients.x.min(), self.patients.x.max()
-        y_min, y_max = self.patients.y.min(), self.patients.y.max()
-        stations = stations[
-            (x_min <= stations.x) & (stations.x <= x_max)
-            & (y_min <= stations.y) & (stations.y <= y_max)
-        ]
-
-        if len(stations) > station_limit:
-            stations = stations.sample(n=station_limit)
-        
         stations.reset_index(drop=True, inplace=True)
-        
         return stations
     
-    def _read_hospital_data(self, hospital_limit: int, clinic_limit: int) -> pd.DataFrame:
-        """Read hospital (and clinic) data. Sample a subset of hospitals (and clinics) if there are too many."""
+    def _read_hospital_data(self, use_clinics: bool) -> pd.DataFrame:
+        """Read hospital (and clinic) data."""
         # All provider data
         providers = pd.read_csv(os.path.join(self.data_dir, 'provider_data.csv'))
         providers = providers[['X', 'Y', 'SERV_TYPE']]
@@ -189,28 +181,20 @@ class EMSData:
         providers['x'], providers['y'] = proj(providers.X, providers.Y)
         providers = providers.drop(columns=['X', 'Y'])
         
-        # Only consider providers within box defined by patient locations
-        x_min, x_max = self.patients.x.min(), self.patients.x.max()
-        y_min, y_max = self.patients.y.min(), self.patients.y.max()
+        # Drop providers too far from patients (1e4 means 10 km)
+        x_min, x_max = self.patients.x.min() - 1e4, self.patients.x.max() + 1e4
+        y_min, y_max = self.patients.y.min() - 1e4, self.patients.y.max() + 1e4
         providers = providers[
             (x_min <= providers.x) & (providers.x <= x_max)
             & (y_min <= providers.y) & (providers.y <= y_max)
         ]
 
-        # Hospital data
-        hospitals = providers[providers.SERV_TYPE.isin(['Hospital - Corporation', 'Hospital - Site'])]
-        if len(hospitals) > hospital_limit:
-            hospitals = hospitals.sample(n=hospital_limit)
+        # Keep only hospitals (and clinics)
+        serv_types = ['Hospital - Corporation', 'Hospital - Site']
+        if use_clinics:
+            serv_types += ['Community Health Centre', 'Independent Health Facility']
+        hospitals = providers[providers.SERV_TYPE.isin(serv_types)]
         hospitals = hospitals[['x', 'y']]
-
-        # Clinic data
-        clinics = providers[providers.SERV_TYPE.isin(['Community Health Centre', 'Independent Health Facility'])]
-        if len(clinics) > clinic_limit:
-            clinics = clinics.sample(n=clinic_limit)
-        clinics = clinics[['x', 'y']]
-        
-        # Merge hospital and clinic data
-        hospitals = pd.concat([hospitals, clinics])
         hospitals.reset_index(drop=True, inplace=True)
 
         return hospitals
@@ -251,13 +235,13 @@ class EMSData:
 
         return demand_nodes, patient2node
 
-    def _assign_patients_to_hospitals(self) -> pd.Series:
+    def _assign_patients_to_hospitals(self, verbose: bool) -> pd.Series:
         """For simulation, we assume patients are always transported to their nearest hospital."""
         patients = self.patients[['x', 'y']].values
         hospitals = self.hospitals[['x', 'y']].values
         euc_dist = lambda p, q: np.linalg.norm(p - q)
         nearest_hospital = lambda i: np.argmin([euc_dist(patients[i], hospitals[j]) for j in range(hospitals.shape[0])])
-        patient2hospital = pd.Series([nearest_hospital(i) for i in range(patients.shape[0])])
+        patient2hospital = pd.Series([nearest_hospital(i) for i in trange(patients.shape[0], desc="Assigning patients to hospitals", disable=not verbose)])
         return patient2hospital
     
     def _read_time_data(self) -> pd.DataFrame:
@@ -329,7 +313,7 @@ class EMSData:
         travel_time *= 60  # Convert to minutes
         return travel_time
 
-    def _compute_travel_times(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _compute_travel_times(self, verbose: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """For every pair of locations where travel may occur, compute average travel time.
 
         Computes average response, transport, and return times.
@@ -347,16 +331,21 @@ class EMSData:
         travel_time = lambda p, q: EMSData.travel_time(euc_dist(p, q)/1000)
 
         average_response_times = np.empty((n_stations, n_patients))
-        for i in range(n_stations):
-            for j in range(n_patients):
-                average_response_times[i, j] = travel_time(stations[i], patients[j])
         average_transport_times = np.empty(n_patients)
-        for i in range(n_patients):
-            average_transport_times[i] = travel_time(patients[i], hospitals[patient2hospital[i]])
         average_return_times = np.empty((n_hospitals, n_stations))
-        for i in range(n_hospitals):
-            for j in range(n_stations):
-                average_return_times[i, j] = self.nonemergent_scale * travel_time(hospitals[i], stations[j])
+        n_iter = n_stations*n_patients + n_patients + n_hospitals*n_stations
+        with tqdm(total=n_iter, desc="Computing travel times", disable=not verbose) as pbar:
+            for i in range(n_stations):
+                for j in range(n_patients):
+                    average_response_times[i, j] = travel_time(stations[i], patients[j])
+                    pbar.update()
+            for i in range(n_patients):
+                average_transport_times[i] = travel_time(patients[i], hospitals[patient2hospital[i]])
+                pbar.update()
+            for i in range(n_hospitals):
+                for j in range(n_stations):
+                    average_return_times[i, j] = self.nonemergent_scale * travel_time(hospitals[i], stations[j])
+                    pbar.update()
         
         return average_response_times, average_transport_times, average_return_times
     
