@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
-"""Python script to create dataset from the results<Process>.csv files that were created using HTCondor.
-
-Usage:
-    python create_dataset.py --region_id <int> [--n_jobs <int>] [--n_replications <int>] [--results_dir <str>]
-"""
+"""Python script to create dataset from the results<Process>.csv files that were created using HTCondor."""
 import os
 import argparse
 import numpy as np
 import pandas as pd
 from tqdm import trange
+import warnings
+
+warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--region_id', type=int, required=True,
                         help="Region ID (1 = Toronto, 4 = Muskoka)")
-    parser.add_argument('--n_jobs', type=int, default=100,
+    parser.add_argument('--n_jobs', type=int, default=200,
                         help="Number of settings<Process>.csv files")
-    parser.add_argument('--n_replications', type=int, default=10,
+    parser.add_argument('--n_replications', type=int, default=1,
                         help="Number of replications per job")
     parser.add_argument('--results_dir', type=str, default='sim_results',
                         help="Directory containing results<Process>.csv files")
-    parser.add_argument('--shuffle', type=bool, default=True,
-                        help="Whether to shuffle the dataset before saving to file (useful if jobs sample the solution space differently)")
     parser.add_argument('--dataset_file', type=str, default='dataset.csv',
                         help="Filename of the dataset to be created")
     args = parser.parse_args()
@@ -36,36 +33,39 @@ if __name__ == '__main__':
     else:
         raise ValueError("region_id not supported")
     
-    station_col_names = [f'station{i}' for i in range(n_stations)]
-    covered_total_col_names = sum([[f'covered{i}', f'total{i}'] for i in range(n_demand_nodes)], [])
-    coverage_col_names = [f'coverage{i}' for i in range(n_demand_nodes)]
-    header = station_col_names + covered_total_col_names
+    sim_input_col_names = [f'solution_{i}' for i in range(n_stations)]
+    sim_output_col_names = sum([[f'n_covered_{i}', f'response_time_{i}', f'n_calls_from_{i}'] for i in range(n_demand_nodes)]
+                               + [[f'n_blocked_{j}', f'n_calls_to_{j}'] for j in range(n_stations)], [])
+    coverage_col_names = [f'coverage_{i}' for i in range(n_demand_nodes)]
+    avg_response_time_col_names = [f'avg_response_time_{i}' for i in range(n_demand_nodes)]
+    blocking_prob_col_names = [f'blocking_prob_{j}' for j in range(n_stations)]
+    header = sim_input_col_names + sim_output_col_names
+    output_col_names = coverage_col_names + avg_response_time_col_names + blocking_prob_col_names
 
     dataset = []
     for i in trange(args.n_jobs):
         results = pd.read_csv(os.path.join(args.results_dir, f'results{i}.csv'), names=header)
 
         # Group every n_replications rows together. Within a group:
-        # - station columns are the same, so take the first row
-        # - covered and total columns are summed
-        results['solution'] = np.arange(len(results)) // args.n_replications
-        station_cols = results.groupby('solution')[station_col_names].first()
-        coverage_cols = results.groupby('solution')[covered_total_col_names].sum()
+        # - Input (solution) columns are the same, so take the first row
+        # - Output (n_covered, response_time, etc.) columns are summed
+        results['soln_id'] = np.arange(len(results)) // args.n_replications
+        station_cols = results.groupby('soln_id')[sim_input_col_names].first()
+        output_cols = results.groupby('soln_id')[sim_output_col_names].sum()
 
-        # Compute coverage columns, merge with station columns
+        # Compute coverage and avg_response_time columns, merge with station columns
         for i in range(n_demand_nodes):
-            coverage_cols[f'coverage{i}'] = coverage_cols[f'covered{i}'] / coverage_cols[f'total{i}']
-        agg_results = pd.concat([station_cols, coverage_cols[coverage_col_names]], axis=1)
+            output_cols[f'coverage_{i}'] = output_cols[f'n_covered_{i}'] / output_cols[f'n_calls_from_{i}']
+            output_cols[f'avg_response_time_{i}'] = output_cols[f'response_time_{i}'] / output_cols[f'n_calls_from_{i}']
+        for j in range(n_stations):
+            output_cols[f'blocking_prob_{j}'] = output_cols[f'n_blocked_{j}'] / output_cols[f'n_calls_to_{j}']
+        agg_results = pd.concat([station_cols, output_cols[output_col_names]], axis=1)
 
         dataset.append(agg_results)
     
     dataset = pd.concat(dataset)
 
     # Impute NaNs with column mean
-    dataset.fillna(dataset[coverage_col_names].mean(), inplace=True)
-
-    # Shuffle rows
-    if args.shuffle:
-        dataset = dataset.sample(frac=1)
+    dataset.fillna(dataset[output_col_names].mean(), inplace=True)
 
     dataset.to_csv(args.dataset_file, index=False)

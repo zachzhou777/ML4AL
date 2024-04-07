@@ -1,35 +1,49 @@
 #!/usr/bin/env python3
 """Python script to generate settings<Process>.csv files for HTCondor.
 
-There are two ways to generate solutions:
-1. generate_all_solutions: This function generates all possible
-    solutions, from which we can randomly sample a subset without
-    replacement. This is only feasible when n and k are small, as the
-    number of solutions is n+k-1 choose k-1.
-2. generate_random_solutions: This function generates random solutions.
-    It does not guarantee solutions are unique, but for large n and k,
-    it is unlikely to generate duplicates.
+In principle, if we had infinite computational resources, we would
+generate all possible solutions and run the simulation for each one.
+Specifically, we would only need to evaluate solutions that use all
+available ambulances, i.e., a fixed total. Therefore, the most basic way
+of generating solutions is to fix the total number of ambulances and
+sample uniformly at random from the space of solutions using exactly
+that number of ambulances.
 
-When n and k are small (calculate n+k-1 choose k-1 to see if the total
-number of solutions is reasonable), generate_all_solutions should be
-used as it guarantees unique solutions. When n and k are large,
-generate_random_solutions should be used as it is computationally
-infeasible to generate all solutions, and the larger n and k are, the
-less likely generate_random_solutions is to generate duplicates.
+However, this may not be the best way to curate the dataset. Consider
+the following strategies:
+- Sparsity: Randomly fix some stations to have zero ambulances.
+- Random total number of ambulances: Self explanatory.
+- "Consecutive" solutions: For a given solution, pick a random station
+    and add ambulances to it to get new solutions.
 
-Usage:
-    python htcondor_setup.py --region_id <int> --n_jobs <int> --solutions_per_job <int> --settings_dir <str> [--generate_all]
+Sparsity may be useful as it could allow the model to learn more about
+individual stations. The other two strategies may be useful in teaching
+the model to behave monotonically, i.e., adding ambulances improves
+coverage. If every solution uses the same total number of ambulances,
+then the model may end up learning that certain stations are "good" and
+others are "bad." Adding ambulances to a bad station implies taking them
+away from a good station, furthermore the model may incorrectly learn
+that adding ambulances to a bad station reduces coverage. Using
+consecutive solutions directly teaches monotonicity.
+
+Note the following when using consecutive solutions:
+- This script groups consecutive solutions together. To retrieve only
+    the starting solutions, use something like `X[::n_consecutive]`.
+- When using scikit-learn's train_test_split, use shuffle=False to keep
+    consecutive solutions together. The solutions are already sampled
+    randomly, so shuffling is not necessary.
 """
 import os
-import csv
 import random
 import argparse
+from typing import Optional
 import numpy as np
 
-# This function generates all possible solutions, so it should be used only when n and k are small
+# This function generates all possible solutions using exactly n ambulances
 # To see total number of solutions without generating them:
 # import math; math.comb(n+k-1, k-1)
 # For Toronto (n=234, k=46), there are 2.209e52 solutions
+# Deprecated but kept in case it is needed in the future (for small instances, can simulate all possible solutions)
 def generate_all_solutions(n, k):
     """Generate all k-tuples of non-negative integers whose sum is n.
     
@@ -42,73 +56,107 @@ def generate_all_solutions(n, k):
             for j in generate_all_solutions(n-i, k-1):
                 yield (i,) + j
 
-# This function generates random solutions, so it can be used when n and k are large
-# It does not guarantee solutions are unique, but for large n and k, it is unlikely to generate duplicates
-def generate_random_solutions(n, k, m=1000, zeros=0):
-    """Generate m random k-tuples of non-negative integers whose sum is n.
+def generate_random_solutions(
+        ambulances: tuple[int, int],
+        stations: int,
+        solutions: int = 1000,
+        zeros: Optional[tuple[int, int]] = None
+    ) -> np.ndarray:
+    """Generate random solutions for the ambulance location problem.
 
-    The tricky part is that the sampling must be done uniformly at random.
-
-    TODO: Docstring needs to be updated, still not decided on how to generate random solutions
+    The method for generating a random solution is as follows:
+    1. Determine (randomly) the total number of ambulances (`ambulances` parameter).
+    2. Determine (randomly) a subset of stations to be excluded from random allocation of ambulances (`zeros` parameter).
+    3. Sample uniformly at random from the space of solutions with the given total number of ambulances and the given subset of stations forced to have zero ambulances.
 
     Parameters
     ----------
-    n : int | tuple[int, int]
-        If int, sum of each k-tuple. If tuple, interval to sample uniformly from (endpoints included).
+    ambulances : tuple[int, int]
+        For each solution, the total number of ambulances is sampled from random.randint(*ambulances); may get something outside this range due to rounding.
     
-    k : int
-        Length of each k-tuple.
+    stations : int
+        Number of stations.
     
-    m : int, optional
-        Number of k-tuples to generate.
+    solutions : int, optional
+        Number of solutions to sample.
     
-    zeros : float | int, optional
-        If float, proportion of zeros in each k-tuple. If int, number of zeros in each k-tuple.
+    zeros : tuple[int, int], optional
+        If provided, for each solution, the number of stations forced to have zero ambulances is sampled from random.randint(*zeros).
     
     Returns
     -------
-    np.ndarray of shape (m, k)
-        Each row is a k-tuple of non-negative integers whose sum is n.
+    np.ndarray of shape (solutions, stations)
+        Randomly generated solutions.
     """
-    # Sample p ~ Dirichlet([1, 1, ..., 1]); p is sampled uniformly at random from the (k-1)-simplex
-    # TODO: A possibly useful trick, to force some components to be zeros, set corresponding alpha to np.finfo(float).eps
-    p = np.random.dirichlet(alpha=np.ones(k), size=m)
+    X = []
+    for _ in range(solutions):
+        # p ~ Dirichlet([1, 1, ..., 1]) is sampled uniformly from the standard simplex
+        # A trick: to ignore some components (i.e., force them to be zeros), set corresponding alphas to np.finfo(float).eps
+        alpha = np.ones(stations)
+        if zeros is not None:
+            zeros_idx = random.sample(range(stations), random.randint(*zeros))
+            alpha[zeros_idx] = np.finfo(float).eps
+        p = np.random.dirichlet(alpha=alpha)
+        # Generate a solution by rounding q*p where q = total number of ambulances
+        x = np.round(random.randint(*ambulances)*p)
+        X.append(x)
+    return np.array(X)
 
-    # n*p is roughly what we want, but need to be careful about rounding to ensure sum is n
-    fractional_part, integral_part = np.modf(n*p)
-    x = integral_part.astype(int)
+def generate_consecutive_solutions(starting_solutions: np.ndarray, new_solutions: int = 1) -> np.ndarray:
+    """Generate "consecutive" solutions for starting solutions.
 
-    # Only round up the largest fractional parts until the sum is n
-    deficit = n - x.sum(axis=1)
-    round_up = np.argpartition(-fractional_part, deficit, axis=1)
-    for i in range(m):
-        x[i, round_up[i, :deficit[i]]] += 1
+    For each starting solution, pick a random station and add ambulances to it to get consecutive solutions.
 
-    return x
-
-# TODO: Right now random solutions sample {x : sum(x) = n, x >= 0, x int}. We need to sample differently. Some strategies:
-# 1. Add argument for sparsity, force some components to be zeros. Pick some bases to have ambulances, others get zero.
-# 2. Add argument to allow total number of ambulances to be random. May help neural net behave monotonically, i.e., taking a solution and adding ambulances shouldn't make coverage worse.
-# 3. Add argument to add "consecutive" solutions: if x is a solution, then x+(0,...,0,1,0,...,0) is also a solution. For each solution, pick a random station and add "consecutive" solutions. Should help with monotonicity.
+    Parameters
+    ----------
+    starting_solutions : np.ndarray of shape (n, p)
+        Starting solutions to generate "consecutive" solutions for.
+    
+    new_solutions : int, optional
+        Number of new solutions to generate for each starting solution.
+    
+    Returns
+    -------
+    np.ndarray of shape (new_solutions*n, p)
+        Consecutive solutions. Includes starting solutions; every (new_solutions+1)-th solution is a starting solution.
+    """
+    X = []
+    p = starting_solutions.shape[1]
+    for x in starting_solutions:
+        X.append(x)
+        station_idx = random.randint(0, p-1)
+        for _ in range(new_solutions):
+            x = x.copy()
+            x[station_idx] += 1
+            X.append(x)
+    return np.array(X)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--region_id', type=int, required=True,
-                        help="Region ID (1 = Toronto, 4 = Muskoka)")
-    parser.add_argument('--n_jobs', type=int, default=100,
+                        help="Region ID (1 = Toronto, 4 = Muskoka); sets total number of ambulances if `ambulances` argument is not provided")
+    parser.add_argument('--n_jobs', type=int, default=200,
                         help="Number of jobs to run, results in one settings<Process>.csv file per job")
-    parser.add_argument('--solutions_per_job', type=int, default=1000,
+    parser.add_argument('--solutions_per_job', type=int, default=500,
                         help="Number of solutions per job, equivalent to number of lines per settings<Process>.csv file")
+    parser.add_argument('--ambulances', type=int, nargs=2, default=None,
+                        help="For each solution, the total number of ambulances is sampled from random.randint(*ambulances); may get something outside this range due to rounding")
+    parser.add_argument('--zeros', type=int, nargs=2, default=None,
+                        help="For each solution, the number of stations forced to have zero ambulances is sampled from random.randint(*zeros)")
+    parser.add_argument('--n_consecutive', type=int, default=1,
+                        help="Number of consecutive solutions to generate (1 means no consecutive solutions, all solutions are random)")
     parser.add_argument('--settings_dir', type=str, default='sim_settings',
                         help="Directory to save settings<Process>.csv files")
-    parser.add_argument('--generate_all', action='store_true',
-                        help="Whether to use generate_all_solutions or generate_random_solutions (see comments in code for explanation of which to use)")
     args = parser.parse_args()
 
-    # Set n_ambulances (n) and n_stations (k)
+    # Check that the total number of solutions (n_jobs*solutions_per_job) is divisible by n_consecutive
+    if (args.n_jobs*args.solutions_per_job) % args.n_consecutive != 0:
+        raise ValueError("Total number of solutions (n_jobs*solutions_per_job) must be divisible by n_consecutive")
+    
+    # Set n_ambulances and n_stations
     if args.region_id == 1:  # Toronto
         # Source: https://www.toronto.ca/wp-content/uploads/2021/04/9765-Annual-Report-2020-web-final-compressed.pdf
-        n_ambulances = 75  #234  # TODO: Either switch back to 234 or add argument for n_ambulances
+        n_ambulances = 234
         n_stations = 46
     elif args.region_id == 4:  # Muskoka
         # TODO: Check number of ambulances makes sense
@@ -118,20 +166,21 @@ if __name__ == '__main__':
         raise ValueError("region_id not supported")
     
     os.makedirs(args.settings_dir, exist_ok=True)
-    if args.generate_all:
-        # Generate all solutions and randomly sample a subset
-        all_solutions = list(generate_all_solutions(n_ambulances, n_stations))
-        some_solutions = random.sample(all_solutions, args.n_jobs*args.solutions_per_job)
-        # Write settings<Process>.csv files
-        for i in range(args.n_jobs):
-            with open(os.path.join(args.settings_dir, f'settings{i}.csv'), 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerows(some_solutions[args.solutions_per_job*i:args.solutions_per_job*(i+1)])
-    else:
-        generated_solutions = set()  # Keep track of unique solutions
-        for i in range(args.n_jobs):
-            some_solutions = generate_random_solutions(n_ambulances, n_stations, args.solutions_per_job)
-            for soln in some_solutions:
-                generated_solutions.add(tuple(soln))
-            np.savetxt(os.path.join(args.settings_dir, f'settings{i}.csv'), some_solutions, delimiter=',', fmt='%d')
-        print(f"{len(generated_solutions)}/{args.n_jobs*args.solutions_per_job} solutions are unique")
+    generated_solutions = set()  # Keep track of unique solutions
+
+    # Generate starting solutions
+    n_starting_solutions = (args.n_jobs*args.solutions_per_job) // args.n_consecutive
+    if args.ambulances is None:
+        args.ambulances = (n_ambulances, n_ambulances)
+    solutions = generate_random_solutions(args.ambulances, n_stations, n_starting_solutions, args.zeros)
+
+    # Generate consecutive solutions
+    if args.n_consecutive > 1:
+        solutions = generate_consecutive_solutions(solutions, args.n_consecutive-1)
+    
+    # Save solutions to settings<Process>.csv files
+    for i, some_solutions in enumerate(np.split(solutions, args.n_jobs)):
+        for soln in some_solutions:
+            generated_solutions.add(tuple(soln))
+        np.savetxt(os.path.join(args.settings_dir, f'settings{i}.csv'), some_solutions, delimiter=',', fmt='%d')
+    print(f"{len(generated_solutions)}/{args.n_jobs*args.solutions_per_job} solutions are unique")

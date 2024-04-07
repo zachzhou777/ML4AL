@@ -19,7 +19,6 @@ with open(f'settings{sys.argv[1]}.csv', 'r') as f:
         solutions.append(solution)
 
 sim = Simulation.load_instance('simulation.pkl')
-n_stations = sim.average_response_times.shape[0]
 all_results = []
 for solution in solutions:
     results = sim.run(solution)

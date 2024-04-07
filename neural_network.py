@@ -1,4 +1,4 @@
-from typing import Callable
+from typing import Callable, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,9 +8,7 @@ from tqdm import tqdm
 class MLP(nn.Sequential):
     """Multilayer perceptron.
 
-    Custom architecture for our use case:
-    - Hidden activation function is ReLU.
-    - Output activation function is sigmoid.
+    Hidden units apply ReLU activation function.
 
     Parameters
     ----------
@@ -42,7 +40,6 @@ class MLP(nn.Sequential):
             ]
             in_dim = hidden_dim
         layers.append(nn.Linear(in_dim, out_dim))
-        # Do not include output layer's activation function here, loss function must accept logits
         super().__init__(*layers)
     
     def save_model(self, filepath: str = 'model.pt'):
@@ -93,11 +90,13 @@ class MLP(nn.Sequential):
         batch_size: int = 128,
         max_epochs: int = 100,
         patience: int = 10,
-        tolerance: float = 1e-4,
+        tolerance: float = 0.0,
         filepath: str = 'model.pt',
         verbose: bool = True
     ):
-        """Train model using early stopping.
+        """Train model.
+
+        Saves model's state_dict to file whenever dev loss improves. Performs early stopping.
 
         Parameters
         ----------
@@ -105,16 +104,16 @@ class MLP(nn.Sequential):
             Training set inputs.
         
         y_train : torch.Tensor of shape (train_size, out_dim)
-            Training set target probabilities.
+            Training set targets.
         
         X_dev : torch.Tensor of shape (dev_size, in_dim)
             Dev set inputs.
         
         y_dev : torch.Tensor of shape (dev_size, out_dim)
-            Dev set target probabilities.
+            Dev set targets.
         
         loss_fn : Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
-            Loss function. Takes logits and target probabilities as inputs and returns a tensor of shape (1,) containing the loss.
+            Loss function. Takes prediction and ground truth as inputs, and returns a tensor of shape (1,) containing the loss.
         
         optimizer : torch.optim.Optimizer, optional
             Optimizer to use.
@@ -175,24 +174,19 @@ class MLP(nn.Sequential):
     def predict(
         self,
         X: torch.Tensor,
-        modified_sigmoid: bool = True,
+        activation: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         batch_size: int = 128,
         verbose: bool = True
     ) -> torch.Tensor:
-        """Predict output probabilities.
-
-        Not the same as calling `forward`:
-        - `forward` returns logits (no output activation).
-        - `predict` runs in evaluation mode (no dropout) and disables gradient tracking.
-        - `predict` runs in batches and comes with a progress bar.
+        """Predict outputs.
 
         Parameters
         ----------
         X : torch.Tensor of shape (n_samples, in_dim)
             Input.
         
-        modified_sigmoid : bool, optional
-            Whether to use modified sigmoid function.
+        activation : Callable[[torch.Tensor], torch.Tensor], optional
+            Output activation function. If None, do nothing.
         
         batch_size : int, optional
             Batch size.
@@ -203,15 +197,16 @@ class MLP(nn.Sequential):
         Returns
         -------
         torch.Tensor of shape (n_samples, out_dim)
-            Output probabilities.
+            Output.
         """
         self.eval()
         with torch.no_grad():
-            sigmoid = MLP.modified_sigmoid if modified_sigmoid else F.sigmoid
             y = []
             dataloader = DataLoader(X, batch_size=batch_size, shuffle=False)
             for X_batch in tqdm(dataloader, desc="Predicting", disable=not verbose):
-                y_batch = sigmoid(self(X_batch))
+                y_batch = self(X_batch)
+                if activation is not None:
+                    y_batch = activation(y_batch)
                 y.append(y_batch)
             y = torch.cat(y)
         self.train()
@@ -225,22 +220,18 @@ class MLP(nn.Sequential):
         batch_size: int = 128,
         verbose: bool = True
     ) -> float:
-        """Evaluate loss function on a dataset.
-
-        Not the same as calling `loss_fn(self(X), y).item()`:
-        - `evaluate_loss` runs in evaluation mode (no dropout) and disables gradient tracking.
-        - `evaluate_loss` runs in batches and comes with a progress bar.
+        """Evaluate loss function.
 
         Parameters
         ----------
         X : torch.Tensor of shape (n_samples, in_dim)
-            Inputs.
+            Input.
         
         y : torch.Tensor of shape (n_samples, out_dim)
-            Targets probabilities.
+            Target.
         
         loss_fn : Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
-            Loss function. Takes logits and target probabilities as inputs and returns a tensor of shape (1,) containing the loss.
+            Loss function. Takes prediction and ground truth as inputs, and returns a tensor of shape (1,) containing the loss.
         
         batch_size : int, optional
             Batch size.
@@ -267,7 +258,7 @@ class MLP(nn.Sequential):
     
     @staticmethod
     def modified_sigmoid(z: torch.Tensor) -> torch.Tensor:
-        """A smooth concave function that returns sigmoid(z) for z >= 0 and 0.25*z + 0.5 for z < 0.
+        """A smooth concave function that returns sigmoid(z) for z > 0, 0.25*z + 0.5 otherwise.
         
         Reasons for using this instead of the true sigmoid function:
         - The MIP formulation implements a piecewise linear approximation of this function.
@@ -281,57 +272,57 @@ class MLP(nn.Sequential):
         Returns
         -------
         torch.Tensor
-            sigmoid(z) if z >= 0, 0.25*z + 0.5 otherwise.
+            sigmoid(z) if z > 0, 0.25*z + 0.5 otherwise.
         """
-        return torch.minimum(torch.sigmoid(z), 0.25*z + 0.5)
+        return torch.where(z > 0, torch.sigmoid(z), 0.25*z + 0.5)
     
     @staticmethod
-    def regression_loss(
-        logits: torch.Tensor,
-        targets: torch.Tensor,
-        weights: torch.Tensor,
-        sum_outputs: bool = False,
-        modified_sigmoid: bool = False,
-        weight_overestimate: float = 1.0
+    def demand_weighted_loss(
+        input: torch.Tensor,
+        target: torch.Tensor,
+        demand: torch.Tensor,
+        activation: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        sum_outputs: bool = True,
+        weight_overestimate: float = 1.0,
+        weight_underestimate: float = 1.0
     ) -> torch.Tensor:
-        """Custom regression loss.
+        """Custom loss for predicting ambulance location metrics.
 
-        To use in MLP.fit and MLP.evaluate_loss, wrap in another function:
-        loss_fn = lambda logits, targets: MLP.regression_loss(logits, targets, weights, sum_outputs, modified_sigmoid)
+        To use in MLP.fit and MLP.evaluate_loss, wrap in another function that takes only input and target as arguments (e.g., a lambda function).
 
         Parameters
         ----------
-        logits : torch.Tensor of shape (n_samples, out_dim)
-            Logits.
+        input : torch.Tensor of shape (n_samples, out_dim)
+            Model prediction (before output activation function is applied).
         
-        targets : torch.Tensor of shape (n_samples, out_dim)
-            Target probabilities.
+        target : torch.Tensor of shape (n_samples, out_dim)
+            Ground truth.
         
-        weights : torch.Tensor of shape (out_dim,)
-            Output weights.
+        demand : torch.Tensor of shape (out_dim,)
+            Demand weights.
+        
+        activation : Callable[[torch.Tensor], torch.Tensor], optional
+            Output activation function. If None, do nothing.
         
         sum_outputs : bool, optional
             Whether to sum weighted outputs before feeding into MSE loss.
         
-        modified_sigmoid : bool, optional
-            Whether to use modified sigmoid function.
-        
         weight_overestimate : float, optional
             Multiplier applied when prediction exceeds target.
+        
+        weight_underestimate : float, optional
+            Multiplier applied when prediction falls short of target.
         
         Returns
         -------
         torch.Tensor
             A scalar tensor containing the loss.
         """
-        sigmoid = MLP.modified_sigmoid if modified_sigmoid else F.sigmoid
+        if activation is not None:
+            input = activation(input)
         mul = torch.matmul if sum_outputs else torch.mul
-        weighted_predictions = mul(sigmoid(logits), weights)
-        # TODO: Would it make sense to turn targets into logits and then apply MLP.modified_sigmoid? This would only be done if modified_sigmoid==True.
-        # if modified_sigmoid:
-        #     target_logits = torch.log(targets / (1 - targets))
-        #     targets = MLP.modified_sigmoid(target_logits)
-        weighted_targets = mul(targets, weights)
-        # When weight_overestimate=1.0, this is equivalent to F.mse_loss(weighted_predictions, weighted_targets)
-        loss = torch.where(weighted_predictions > weighted_targets, weight_overestimate, 1.0) * (weighted_predictions - weighted_targets)**2
+        weighted_predictions = mul(input, demand)
+        weighted_targets = mul(target, demand)
+        # When weights are 1.0, this is equivalent to F.mse_loss(weighted_predictions, weighted_targets)
+        loss = torch.where(weighted_predictions > weighted_targets, weight_overestimate, weight_underestimate) * (weighted_predictions - weighted_targets)**2
         return loss.mean()
