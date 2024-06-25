@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Python script to generate settings<Process>.csv files for HTCondor.
 
+TODO: Update this docstring. Most of the information is outdated.
+
 In principle, if we had infinite computational resources, we would
 generate all possible solutions and run the simulation for each one.
 Specifically, we would only need to evaluate solutions that use all
@@ -34,133 +36,97 @@ Note the following when using consecutive solutions:
     randomly, so shuffling is not necessary.
 """
 import os
-import random
 import argparse
-from typing import Optional
+import itertools
 import numpy as np
 
-# This function generates all possible solutions using exactly n ambulances
-# To see total number of solutions without generating them:
-# import math; math.comb(n+k-1, k-1)
-# For Toronto (n=234, k=46), there are 2.209e52 solutions
-# Deprecated but kept in case it is needed in the future (for small instances, can simulate all possible solutions)
-def generate_all_solutions(n, k):
-    """Generate all k-tuples of non-negative integers whose sum is n.
-    
-    Source: https://stackoverflow.com/a/7748851
-    """
-    if k == 1:
-        yield (n,)
-    else:
-        for i in range(n+1):
-            for j in generate_all_solutions(n-i, k-1):
-                yield (i,) + j
-
 def generate_random_solutions(
-        ambulances: tuple[int, int],
-        stations: int,
-        solutions: int = 1000,
-        zeros: Optional[tuple[int, int]] = None
-    ) -> np.ndarray:
+    min_ambulances: int,
+    max_ambulances: int,
+    n_stations: int,
+    alpha: float,
+    n_solutions: int
+) -> np.ndarray:
     """Generate random solutions for the ambulance location problem.
 
-    The method for generating a random solution is as follows:
-    1. Determine (randomly) the total number of ambulances (`ambulances` parameter).
-    2. Determine (randomly) a subset of stations to be excluded from random allocation of ambulances (`zeros` parameter).
-    3. Sample uniformly at random from the space of solutions with the given total number of ambulances and the given subset of stations forced to have zero ambulances.
+    To generate a single solution with n_ambulances ambulances, we first
+    sample a probability vector p from a Dirichlet distribution, then
+    scale p by n_ambulances, and finally round the result while ensuring
+    the vector sums to exactly n_ambulances.
 
     Parameters
     ----------
-    ambulances : tuple[int, int]
-        For each solution, the total number of ambulances is sampled from random.randint(*ambulances); may get something outside this range due to rounding.
+    min_ambulances, max_ambulances : int
+        Minimum and maximum number of ambulances for each solution.
+
+        When generating solutions, the number of ambulances cycles
+        through the range of possible values.
     
-    stations : int
+    n_stations : int
         Number of stations.
     
-    solutions : int, optional
+    alpha : float
+        The value of each concentration parameter in the Dirichlet
+        distribution.
+
+        Setting alpha=1 results in sampling p from the standard simplex
+        uniformly at random. This (I believe) leads to sampling from the
+        solution space (non-negative integer vectors whose sum is
+        n_ambulances) uniformly at random (it is not obvious whether
+        rounding preserves uniformity).
+        
+        Higher values of alpha make the distribution more concentrated
+        around the uniform distribution. This leads to sampling
+        solutions with close to the same number of ambulances at each
+        station.
+    
+    n_solutions : int, optional
         Number of solutions to sample.
     
-    zeros : tuple[int, int], optional
-        If provided, for each solution, the number of stations forced to have zero ambulances is sampled from random.randint(*zeros).
-    
     Returns
     -------
-    np.ndarray of shape (solutions, stations)
+    np.ndarray of shape (n_solutions, n_stations)
         Randomly generated solutions.
     """
+    alpha = np.full(n_stations, alpha)
+    cycle_iter = itertools.cycle(range(min_ambulances, max_ambulances+1))
     X = []
-    for _ in range(solutions):
-        # p ~ Dirichlet([1, 1, ..., 1]) is sampled uniformly from the standard simplex
-        # A trick: to ignore some components (i.e., force them to be zeros), set corresponding alphas to np.finfo(float).eps
-        alpha = np.ones(stations)
-        if zeros is not None:
-            zeros_idx = random.sample(range(stations), random.randint(*zeros))
-            alpha[zeros_idx] = np.finfo(float).eps
-        p = np.random.dirichlet(alpha=alpha)
-        # Generate a solution by rounding q*p where q = total number of ambulances
-        x = np.round(random.randint(*ambulances)*p)
+    for p in np.random.dirichlet(alpha=alpha, size=n_solutions):
+        n_ambulances = next(cycle_iter)
+        # Separate n_ambulances*p into integer and fractional parts
+        remainder, x = np.modf(n_ambulances*p)
+        x = x.astype(int)
+        # x.sum() almost surely falls short of n_ambulances
+        deficit = n_ambulances - x.sum()
+        # Round largest `deficit` remainders
+        round_up = np.argsort(-remainder)[:deficit]
+        x[round_up] += 1
         X.append(x)
-    return np.array(X)
-
-def generate_consecutive_solutions(starting_solutions: np.ndarray, new_solutions: int = 1) -> np.ndarray:
-    """Generate "consecutive" solutions for starting solutions.
-
-    For each starting solution, pick a random station and add ambulances to it to get consecutive solutions.
-
-    Parameters
-    ----------
-    starting_solutions : np.ndarray of shape (n, p)
-        Starting solutions to generate "consecutive" solutions for.
-    
-    new_solutions : int, optional
-        Number of new solutions to generate for each starting solution.
-    
-    Returns
-    -------
-    np.ndarray of shape (new_solutions*n, p)
-        Consecutive solutions. Includes starting solutions; every (new_solutions+1)-th solution is a starting solution.
-    """
-    X = []
-    p = starting_solutions.shape[1]
-    for x in starting_solutions:
-        X.append(x)
-        station_idx = random.randint(0, p-1)
-        for _ in range(new_solutions):
-            x = x.copy()
-            x[station_idx] += 1
-            X.append(x)
     return np.array(X)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--region_id', type=int, required=True,
-                        help="Region ID (1 = Toronto, 4 = Muskoka); sets total number of ambulances if `ambulances` argument is not provided")
+                        help="Region ID (1 = Toronto, 4 = Muskoka); sets min_ambulances, max_ambulances, and n_stations")
+    parser.add_argument('--alpha', type=float, default=2,
+                        help="Shared concentration parameter for Dirichlet distribution")
     parser.add_argument('--n_jobs', type=int, default=200,
                         help="Number of jobs to run, results in one settings<Process>.csv file per job")
     parser.add_argument('--solutions_per_job', type=int, default=500,
                         help="Number of solutions per job, equivalent to number of lines per settings<Process>.csv file")
-    parser.add_argument('--ambulances', type=int, nargs=2, default=None,
-                        help="For each solution, the total number of ambulances is sampled from random.randint(*ambulances); may get something outside this range due to rounding")
-    parser.add_argument('--zeros', type=int, nargs=2, default=None,
-                        help="For each solution, the number of stations forced to have zero ambulances is sampled from random.randint(*zeros)")
-    parser.add_argument('--n_consecutive', type=int, default=1,
-                        help="Number of consecutive solutions to generate (1 means no consecutive solutions, all solutions are random)")
     parser.add_argument('--settings_dir', type=str, default='sim_settings',
                         help="Directory to save settings<Process>.csv files")
     args = parser.parse_args()
-
-    # Check that the total number of solutions (n_jobs*solutions_per_job) is divisible by n_consecutive
-    if (args.n_jobs*args.solutions_per_job) % args.n_consecutive != 0:
-        raise ValueError("Total number of solutions (n_jobs*solutions_per_job) must be divisible by n_consecutive")
     
-    # Set n_ambulances and n_stations
+    # Set min_ambulances, max_ambulances, and n_stations
     if args.region_id == 1:  # Toronto
-        # Source: https://www.toronto.ca/wp-content/uploads/2021/04/9765-Annual-Report-2020-web-final-compressed.pdf
-        n_ambulances = 234
+        min_ambulances = 50
+        max_ambulances = 100
         n_stations = 46
     elif args.region_id == 4:  # Muskoka
-        # TODO: Check number of ambulances makes sense
-        n_ambulances = 30
+        # TODO: May need to change these values
+        min_ambulances = 10
+        max_ambulances = 50
         n_stations = 5
     else:
         raise ValueError("region_id not supported")
@@ -168,15 +134,8 @@ if __name__ == '__main__':
     os.makedirs(args.settings_dir, exist_ok=True)
     generated_solutions = set()  # Keep track of unique solutions
 
-    # Generate starting solutions
-    n_starting_solutions = (args.n_jobs*args.solutions_per_job) // args.n_consecutive
-    if args.ambulances is None:
-        args.ambulances = (n_ambulances, n_ambulances)
-    solutions = generate_random_solutions(args.ambulances, n_stations, n_starting_solutions, args.zeros)
-
-    # Generate consecutive solutions
-    if args.n_consecutive > 1:
-        solutions = generate_consecutive_solutions(solutions, args.n_consecutive-1)
+    # Generate solutions
+    solutions = generate_random_solutions(min_ambulances, max_ambulances, n_stations, args.alpha, args.n_jobs*args.solutions_per_job)
     
     # Save solutions to settings<Process>.csv files
     for i, some_solutions in enumerate(np.split(solutions, args.n_jobs)):

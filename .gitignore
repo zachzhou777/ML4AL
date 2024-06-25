@@ -1,6 +1,9 @@
 __pycache__/
+*.npz
 *.pkl
 *.pt
 data/
 dataset*.csv
 test*
+sim_settings/
+sim_results/

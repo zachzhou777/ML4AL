@@ -224,7 +224,14 @@ class Simulation:
         return travel_time
     
     def run_single_replication(self, solution: list[int]) -> pd.DataFrame:
-        """Run a single replication of the simulation using a given solution.
+        """Run a replication of the simulation using a given solution.
+        
+        When recording response times, we exclude pre-travel delay
+        because it is independent of the solution; we only account for
+        the travel time from the station to the patient, and any
+        additional time the patient must wait if all ambulances in the
+        system are busy. When evaluating coverage, we include pre-travel
+        delay.
 
         Parameters
         ----------
@@ -233,34 +240,27 @@ class Simulation:
         
         Returns
         -------
-        pd.DataFrame of shape (1, 3*n_demand_nodes + 2*n_stations)
+        pd.DataFrame of shape (1, 3*n_demand_nodes)
             Contains the following columns for each demand node i:
-            - n_covered_<i>: Number of arrivals from demand node i covered within the response time threshold
-            - response_time_<i>: Total response time experienced by all arrivals from demand node i
-            - n_calls_from_<i>: Total number of arrivals from demand node i
-
-            And the following columns for each station j:
-            - n_blocked_<j>: Number of times station j has zero ambulances available
-            - n_calls_to_<j>: Number of times station j is queried for an ambulance
-
-            Note that n_blocked_<j> and n_calls_to_<j> are tracked even if zero ambulances are located at station j.
+            - n_covered_<i>: Number of arrivals covered within the response time threshold
+            - response_time_<i>: Total response time (excluding pre-travel delay), summed over all arrivals
+            - n_arrivals_<i>: Total number of arrivals
         """
-        # Copy solution because list is mutable; not really necessary since solution is unchanged by the end, but do it just in case
-        self._available_ambulances = solution.copy()
+        # Tracks number of available ambulances at each station throughout the simulation
+        self._available_ambulances = list(solution)
+        # Priority queue of events (arrivals and returns)
         arrivals = self._create_arrivals()
-        heapq.heapify(arrivals)  # Priority queue
+        heapq.heapify(arrivals)
         self._event_queue = arrivals
-        self._patient_queue = collections.deque()  # FIFO queue for when no ambulances are available
+        # FIFO queue patients must wait in if no ambulances are available
+        self._fifo_queue = collections.deque()
 
         # Log results in self._results array, use self._col2idx to map column names to indices
-        # TODO: Might get rid of columns for blocking probability if we don't end up using them
-        n_stations = self.median_response_times.shape[0]
-        cols = sum([[f'n_covered_{i}', f'response_time_{i}', f'n_calls_from_{i}'] for i in range(self.n_demand_nodes)]
-                   + [[f'n_blocked_{j}', f'n_calls_to_{j}'] for j in range(n_stations)], [])
+        cols = sum([[f'n_covered_{i}', f'response_time_{i}', f'n_arrivals_{i}'] for i in range(self.n_demand_nodes)], [])
         self._col2idx = {col: idx for idx, col in enumerate(cols)}
         self._results = np.zeros(len(cols))
 
-        # The simulation itself; self._results is updated as simulation progresses
+        # Run simulation, self._results is updated as simulation progresses
         while self._event_queue:
             event = heapq.heappop(self._event_queue)
             if event.type == ARRIVAL:
@@ -268,6 +268,7 @@ class Simulation:
             elif event.type == RETURN:
                 self._process_return(event)
         
+        # Convert results to DataFrame
         self._results = pd.DataFrame(self._results.reshape(1, -1), columns=cols)
         self._results = self._results.astype({col: int for col in cols if col.startswith('n_')})
 
@@ -292,32 +293,27 @@ class Simulation:
         return arrivals
     
     def _process_arrival(self, event: Event):
-        """Dispatch the nearest ambulance; if there are no available ambulances, add patient to queue."""
+        """Dispatch the nearest ambulance; if there are no available ambulances, add patient to FIFO queue."""
         current_time = event.time
         patient_id = event.id
         for station_id in self.dispatch_order[patient_id]:
-            # Record that station was queried for an ambulance
-            self._results[self._col2idx[f'n_calls_to_{station_id}']] += 1
             if self._available_ambulances[station_id] > 0:
                 self._dispatch(station_id, patient_id, current_time, current_time)
                 return
-            else:
-                # Record that call was blocked at station
-                self._results[self._col2idx[f'n_blocked_{station_id}']] += 1
-        self._patient_queue.append((patient_id, current_time))
+        self._fifo_queue.append((patient_id, current_time))
     
     def _process_return(self, event: Event):
-        """Increment ambulance count. If patient queue nonempty, dispatch ambulance."""
+        """Increment ambulance count. If FIFO queue nonempty, dispatch ambulance."""
         current_time = event.time
         station_id = event.id
         self._available_ambulances[station_id] += 1
-        # If patient queue nonempty, then this is the only available ambulance, so dispatch immediately
-        if self._patient_queue:
-            patient_id, arrival_time = self._patient_queue.popleft()
+        # If FIFO queue nonempty, then this is the only available ambulance, so dispatch immediately
+        if self._fifo_queue:
+            patient_id, arrival_time = self._fifo_queue.popleft()
             self._dispatch(station_id, patient_id, current_time, arrival_time)
 
     def _dispatch(self, station_id: int, patient_id: int, current_time: float, arrival_time: float):
-        """Decrement ambulance count, sample random times, create return Event, and record results."""
+        """Decrement ambulance count, sample random times, create return Event, and record metrics."""
         # Decrement ambulance count
         self._available_ambulances[station_id] -= 1
 
@@ -334,10 +330,13 @@ class Simulation:
 
         # Record response time, whether covered, and number of calls from this demand node
         demand_node = self.patients.demand_node[patient_id]
-        response_time = current_time + pretravel_delay + response_travel_time - arrival_time
-        self._results[self._col2idx[f'n_covered_{demand_node}']] += response_time < self.response_time_threshold
+        # Don't include pretravel_delay when recording response time, but do include time waiting in FIFO queue (current_time - arrival_time)
+        response_time = response_travel_time + current_time - arrival_time
         self._results[self._col2idx[f'response_time_{demand_node}']] += response_time
-        self._results[self._col2idx[f'n_calls_from_{demand_node}']] += 1
+        # Include pretravel_delay when evaluating coverage
+        response_time += pretravel_delay
+        self._results[self._col2idx[f'n_covered_{demand_node}']] += response_time < self.response_time_threshold
+        self._results[self._col2idx[f'n_arrivals_{demand_node}']] += 1
     
     def run(self, solution: list[int]) -> pd.DataFrame:
         """Run multiple replications of the simulation using a given solution.
@@ -349,17 +348,11 @@ class Simulation:
         
         Returns
         -------
-        pd.DataFrame of shape (n_replications, 3*n_demand_nodes + 2*n_stations)
+        pd.DataFrame of shape (n_replications, 3*n_demand_nodes)
             Contains the following columns for each demand node i:
-            - n_covered_<i>: Number of arrivals from demand node i covered within the response time threshold
-            - response_time_<i>: Total response time experienced by all arrivals from demand node i
-            - n_calls_from_<i>: Total number of arrivals from demand node i
-
-            And the following columns for each station j:
-            - n_blocked_<j>: Number of times station j has zero ambulances available
-            - n_calls_to_<j>: Number of times station j is queried for an ambulance
-
-            Note that n_blocked_<j> and n_calls_to_<j> are tracked even if zero ambulances are located at station j.
+            - n_covered_<i>: Number of arrivals covered within the response time threshold
+            - response_time_<i>: Total response time (excluding pre-travel delay), summed over all arrivals
+            - n_arrivals_<i>: Total number of arrivals
         """
         results = [self.run_single_replication(solution) for _ in range(self.n_replications)]
         results = pd.concat(results, ignore_index=True)

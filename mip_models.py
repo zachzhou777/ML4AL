@@ -2,24 +2,26 @@ import math
 from typing import Optional
 import numpy as np
 from scipy import optimize
+import torch
 import torch.nn as nn
 import gurobipy as gp
 from gurobipy import GRB
 from gurobi_ml.torch import add_sequential_constr
-from ems_data import EMSData
-from neural_network import MLP
 
 def mexclp(
         demand: np.ndarray,
         distance: np.ndarray,
-        threshold: float,
         n_ambulances: int,
+        threshold: float,
         busy_fraction: float,
         facility_capacity: Optional[int] = None,
-        time_limit: float = None,
-        verbose: bool = False
-    ) -> list[int]:
+        fix_solution: Optional[np.ndarray] = None,
+        time_limit: Optional[float] = None,
+        verbose: bool = True
+    ) -> tuple[np.ndarray, float]:
     """Solve the MEXCLP model (Daskin, 1983).
+
+    This function allows for fixing the number of ambulances at each facility (the x variables).
 
     Parameters
     ----------
@@ -29,17 +31,20 @@ def mexclp(
     distance : np.ndarray of shape (n_demand_nodes, n_facilities)
         Distance matrix.
     
-    threshold : float
-        Maximum distance for a facility to cover a demand node.
-    
     n_ambulances : int
         Total number of ambulances.
+    
+    threshold : float
+        Maximum distance for a facility to cover a demand node.
     
     busy_fraction : float
         Average fraction of time an ambulance is busy.
     
     facility_capacity : int, optional
         Maximum number of ambulances allowed at any facility.
+    
+    fix_solution : np.ndarray of shape (n_facilities,), optional
+        Number of ambulances to locate at each facility.
     
     time_limit : float, optional
         Time limit in seconds.
@@ -49,8 +54,11 @@ def mexclp(
     
     Returns
     -------
-    list[int]
+    solution : np.ndarray of shape (n_facilities,)
         Number of ambulances located at each facility.
+    
+    objective_value : float
+        Objective value of the model, i.e., demand-weighted coverage.
     """
     if facility_capacity is None:
         facility_capacity = n_ambulances
@@ -66,11 +74,11 @@ def mexclp(
     y = model.addVars(n_demand_nodes, n_ambulances, vtype=GRB.BINARY)
 
     demand = np.array(demand, dtype=float)
-    demand /= demand.sum()  # Normalize so objective function is expected distance
+    demand /= demand.sum()  # Normalize so objective function is expected coverage
     model.setObjective(
         gp.quicksum(
-            demand[i]*(1-busy_fraction)*busy_fraction**k * y[i, k]
-            for i in range(n_demand_nodes) for k in range(n_ambulances)
+            demand[i] * (1-busy_fraction)*busy_fraction**k * y[i, k]
+            for k in range(n_ambulances) for i in range(n_demand_nodes)
         ),
         GRB.MAXIMIZE
     )
@@ -81,9 +89,13 @@ def mexclp(
     ))
     model.addConstr(x.sum() <= n_ambulances)
 
+    if fix_solution is not None:
+        for j in range(n_facilities):
+            x[j].lb = x[j].ub = fix_solution[j]
+    
     model.optimize()
 
-    return [int(x[j].X) for j in range(n_facilities)]
+    return np.rint([x[j].X for j in range(n_facilities)]).astype(int), model.objVal
 
 def compute_rho(max_servers: int = 100, success_prob: float = 0.95) -> list[float]:
     """Compute rho values needed by queuing constraints.
@@ -100,7 +112,7 @@ def compute_rho(max_servers: int = 100, success_prob: float = 0.95) -> list[floa
     
     Returns
     -------
-    list[float]
+    np.ndarray of shape (max_servers+1,)
         rho[0] is 0. For k > 0, rho[k] is the value of rho for k servers.
     """
     # Function used by scipy.optimize.root_scalar
@@ -109,27 +121,30 @@ def compute_rho(max_servers: int = 100, success_prob: float = 0.95) -> list[floa
         rhs = 1 - success_prob
         return lhs - rhs
     
-    rho = [0]
+    rho = np.zeros(max_servers+1)
     for n_servers in range(1, max_servers+1):
         eq = lambda rho: rho_eq(rho, n_servers=n_servers)
         result = optimize.root_scalar(eq, bracket=[0.0, 2*n_servers])  # 2*servers is usually enough, will raise a ValueError if not
-        rho.append(result.root)
+        rho[n_servers] = result.root
     
     return rho
 
 def pmedian_with_queuing(
-        demand: list[float],
+        demand: np.ndarray,
         distance: np.ndarray,
         n_ambulances: int,
-        arrival_rate: float,
+        arrival_rates: np.ndarray,
         service_rate: float,
         rho: list[float],
-        time_limit: float = None,
-        verbose: bool = False
-    ) -> list[int]:
-    """Solve a model that combines the p-median model with queuing constraints.
+        fix_solution: Optional[np.ndarray] = None,
+        time_limit: Optional[float] = None,
+        verbose: bool = True
+    ) -> tuple[np.ndarray, float] | tuple[None, None]:
+    """Solve a model that combines the p-median model with queuing constraints. Based on Marianov and Serra (2002) and Boutilier and Chan (2022).
 
-    Similar to Boutilier and Chan (2022).
+    This function allows for fixing the number of ambulances at each facility (the x variables).
+
+    Note that the model may be infeasible if the arrival rate is too high relative to the service rate, in which case this function will return (None, None).
 
     Parameters
     ----------
@@ -142,14 +157,17 @@ def pmedian_with_queuing(
     n_ambulances : int
         Total number of ambulances.
     
-    arrival_rate : float
-        System-wide arrival rate. Units are unimportant, only needs to be on the same scale as service_rate.
+    arrival_rates : np.ndarray of shape (n_demand_nodes,)
+        Arrival rate of each demand node. Units are unimportant, only needs to be on the same scale as service_rate.
     
     service_rate : float
-        Service rate of each server. Units are unimportant, only needs to be on the same scale as arrival_rate.
+        Service rate of each server. Units are unimportant, only needs to be on the same scale as arrival_rates.
     
     rho : list[float]
-        Rho values for queuing constraints. rho[0] should be 0. For k > 0, rho[k] should be the value of rho for k servers. Facility capacity is len(rho) - 1.
+        Rho values for queuing constraints. rho[0] should be 0. For k > 0, rho[k] should be the value of rho for k ambulances. Facility capacity is len(rho) - 1.
+    
+    fix_solution : np.ndarray of shape (n_facilities,), optional
+        Number of ambulances to locate at each facility.
     
     time_limit : float, optional
         Time limit in seconds.
@@ -159,11 +177,11 @@ def pmedian_with_queuing(
     
     Returns
     -------
-    x : np.ndarray of shape (n_facilities,)
-        Number of servers located at each facility.
+    solution : np.ndarray of shape (n_facilities,) | None
+        Number of ambulances located at each facility.
     
-    y : np.ndarray of shape (n_demand_nodes, n_facilities)
-        y[i, j] is the fraction of demand at node i that is served by facility j.
+    objective_value : float | None
+        Objective value of the model, i.e., demand-weighted average distance.
     """
     n_demand_nodes, n_facilities = distance.shape
     facility_capacity = len(rho) - 1  # Subtract 1 because rho[0] is 0
@@ -175,7 +193,6 @@ def pmedian_with_queuing(
 
     demand = np.array(demand, dtype=float)
     demand /= demand.sum()  # Normalize so objective function is expected distance
-    arrival_rates = arrival_rate * demand  # Note that demand is normalized
 
     x = model.addVars(n_facilities, facility_capacity, vtype=GRB.BINARY)
     y = model.addVars(n_demand_nodes, n_facilities, lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS)
@@ -198,10 +215,20 @@ def pmedian_with_queuing(
     ))
     model.addConstr(x.sum() <= n_ambulances)
 
+    if fix_solution is not None:
+        for j in range(n_facilities):
+            for k in range(facility_capacity):
+                x[j, k].lb = x[j, k].ub = k < fix_solution[j]
+
     model.optimize()
 
-    return (np.array([int(x.sum(j, '*').getValue()) for j in range(n_facilities)]),
-            np.array([[y[i, j].X for j in range(n_facilities)] for i in range(n_demand_nodes)]))
+    if model.status in {GRB.INFEASIBLE, GRB.INF_OR_UNBD}:
+        return None, None
+    
+    x = np.array([[x[j, k].X for k in range(facility_capacity)] for j in range(n_facilities)])
+    solution = np.rint(x.sum(axis=1)).astype(int)
+
+    return solution, model.objVal
 
 def embed_mlp(
         gurobi_model: gp.Model,
@@ -212,21 +239,30 @@ def embed_mlp(
         M_minus: list[np.ndarray],
         M_plus: list[np.ndarray],
         scale_relu: bool = False
-    ):
+):
     """Embed an MLP in a Gurobi model.
 
-    TODO: Move call to calculate_bounds() inside this function, remove M_minus, M_plus arguments?
+    Assumes the MLP uses the ReLU activation function for hidden layers,
+    and no activation function for the output layer. For our use cases,
+    we use this function to embed everything up to the last hidden layer
+    (not including the last hidden layer's activation function). Thus,
+    when we call this function, weights and biases exclude the last
+    linear layer, and output_vars corresponds to the last hidden layer's
+    pre-activation values.
+
+    Even though every use case we have involves calling this function,
+    calling embed_last_hidden_activation, and implementing the last
+    linear layer, we choose to decouple these steps because most if not
+    all existing works on embedding MLPs do exactly what this function
+    does (e.g., gurobi_ml.torch.add_sequential_constr).
 
     Parameters
     ----------
     gurobi_model : gp.Model
         Gurobi model.
     
-    weights : list[np.ndarray]
-        Weight matrices of the MLP to be embedded.
-    
-    biases : list[np.ndarray]
-        Bias vectors of the MLP to be embedded.
+    weights, biases : list[np.ndarray]
+        Weights and biases of the MLP.
     
     input_vars : gp.MVar
         Decision variables used as input to the MLP.
@@ -241,7 +277,7 @@ def embed_mlp(
         Upper bounds for the net input to each hidden unit.
     
     scale_relu : bool, optional
-        How to model the ReLU activation function in the constraints.
+        How to model the ReLU function for the hidden layers.
         - If False, use the original approach seen in other papers.
         - If True, scale the net inputs to ReLU units so that they are in [-1, 1], then rescale the outputs.
     """
@@ -302,11 +338,8 @@ def calculate_bounds(
 
     Parameters
     ----------
-    weights : list[np.ndarray]
-        Weight matrices of each linear layer.
-    
-    biases : list[np.ndarray]
-        Bias vectors of each linear layer.
+    weights, biases : list[np.ndarray]
+        Weights and biases of the MLP.
     
     n_ambulances : int
         Total number of ambulances.
@@ -350,59 +383,72 @@ def calculate_bounds(
     
     return M_minus, M_plus
 
-def embed_sigmoid(
+def embed_modified_sigmoid(
         gurobi_model: gp.Model,
         input_vars: gp.MVar,
         output_vars: gp.MVar,
         tangent_points: Optional[np.ndarray] = None
     ):
-    """Embed the sigmoid function in a Gurobi model.
-
-    Only suitable under the following conditions:
-    - Must be the output layer.
-    - Optimization model must be a maximization problem.
-    - Output probabilities are generally expected to be greater than 0.5.
-
+    """Embed the modified sigmoid function applied at the last hidden
+    layer in a Gurobi model.
+    
+    We model the function as a piecewise linear function. In general,
+    modeling piecewise linear functions requires introducing additional
+    binary variables, but because the function is concave and the MIP
+    has to maximize it, it is sufficient to use only linear constraints.
+    
     Parameters
     ----------
     gurobi_model : gp.Model
         Gurobi model.
     
     input_vars : gp.MVar
-        Decision variables used as input to the sigmoid.
+        Decision variables used as input to the function.
     
     output_vars : gp.MVar
-        Decision variables used as output from the sigmoid.
+        Decision variables used as output from the function.
     
     tangent_points : np.ndarray, optional
-        Points where tangent lines are used to approximate the sigmoid function.
+        Points where tangent lines are used to approximate the function.
     """
+    gurobi_model.addConstr(output_vars <= 1)
     if tangent_points is None:
         tangent_points = np.linspace(0, 5, 11)
-    sigmoid = lambda z: 1/(1 + np.exp(-z))
-    sigmoid_derivative = lambda z: sigmoid(z)*(1 - sigmoid(z))
-    gurobi_model.addConstrs((output_vars <= sigmoid_derivative(z0)*input_vars + sigmoid(z0) - sigmoid_derivative(z0)*z0 for z0 in tangent_points))
+    s = lambda z: 1/(1 + np.exp(-z))
+    ds = lambda z: s(z)*(1 - s(z))
+    gurobi_model.addConstrs((
+        output_vars <= ds(z)*input_vars + s(z) - ds(z)*z
+        for z in tangent_points
+    ))
 
-def coverage_mlp(
-        demand: list[float],
-        mlp: MLP,
+def mlp_based_model(
+        model_type: str,
+        weights : list[np.ndarray],
+        biases: list[np.ndarray],
         n_ambulances: int,
         facility_capacity: Optional[int] = None,
         use_gurobi_ml: bool = False,
         scale_relu: bool = False,
-        warm_start: list[int] = None,
-        time_limit: float = None,
-        verbose: bool = False,
-    ) -> list[int]:
-    """Solve the Coverage-MLP model.
+        warm_start: Optional[np.ndarray] = None,
+        time_limit: Optional[float] = None,
+        verbose: bool = True
+    ) -> np.ndarray:
+    """Solve the Coverage/p-Median-MLP model.
+
+    If solving the Coverage-MLP model, the last hidden layer's
+    activation function is assumed to be the modified sigmoid function
+    (sigmoid(z) for z > 0, 0.25*z + 0.5 otherwise) and the objective is
+    to maximize coverage. If solving the p-Median-MLP model, the last
+    hidden layer's activation function is assumed to be the ReLU
+    function and the objective is to minimize average response time.
 
     Parameters
     ----------
-    demand : list[float]
-        Weight of each demand node.
+    model_type : {'coverage', 'p-median'}
+        Type of model to solve.
     
-    mlp : MLP
-        MLP predicting coverage probabilities given a solution.
+    weights, biases : list[np.ndarray]
+        Weights and biases of the MLP.
     
     n_ambulances : int
         Total number of ambulances.
@@ -411,14 +457,18 @@ def coverage_mlp(
         Maximum number of ambulances allowed at any facility.
     
     use_gurobi_ml : bool, optional
-        Use the Gurobi Machine Learning package to embed the MLP in the MIP model.
+        Use the Gurobi Machine Learning package to embed everything up
+        to the last hidden layer (not including the last hidden layer's
+        activation function).
     
     scale_relu : bool, optional
-        How to model the ReLU activation function in the constraints. Ignored if use_gurobi_ml is True.
+        How to model the ReLU activation function for hidden layers.
+        Ignored if use_gurobi_ml is True.
         - If False, use the original approach seen in other papers.
-        - If True, scale the net inputs to ReLU units so that they are in [-1, 1], then rescale the outputs.
+        - If True, scale the net inputs to ReLU units so that they are
+        in [-1, 1], then rescale the outputs.
     
-    warm_start : list[int], optional
+    warm_start : np.ndarray of shape (n_facilities,), optional
         Initial solution.
     
     time_limit : float, optional
@@ -429,45 +479,57 @@ def coverage_mlp(
     
     Returns
     -------
-    list[int]
+    np.ndarray of shape (n_facilities,)
         Number of ambulances located at each facility.
     """
     if facility_capacity is None:
         facility_capacity = n_ambulances
-    
-    linear_layers = [layer for layer in mlp if isinstance(layer, nn.Linear)]
-    weights = [layer.weight.detach().cpu().numpy() for layer in linear_layers]
-    biases = [layer.bias.detach().cpu().numpy() for layer in linear_layers]
 
     model = gp.Model()
     if time_limit is not None:
         model.Params.TimeLimit = time_limit
     model.Params.LogToConsole = verbose
 
-    n_demand_nodes = len(demand)
-    n_facilities = mlp[0].in_features
+    n_facilities = weights[0].shape[1]
+    n_demand_nodes = weights[-1].shape[1]
 
     x = model.addMVar(n_facilities, lb=0, ub=facility_capacity, vtype=GRB.INTEGER)
     z = model.addMVar(n_demand_nodes, lb=-GRB.INFINITY, ub=GRB.INFINITY, vtype=GRB.CONTINUOUS)
-    y = model.addMVar(n_demand_nodes, lb=-GRB.INFINITY, ub=1.0, vtype=GRB.CONTINUOUS)
+    y = model.addMVar(n_demand_nodes, lb=-GRB.INFINITY, ub=GRB.INFINITY, vtype=GRB.CONTINUOUS)
 
-    # Demand-weighted coverage
-    demand = np.array(demand, dtype=float)
-    demand /= demand.sum()  # Normalize so objective function is expected distance
-    model.setObjective(demand@y, GRB.MAXIMIZE)
+    # Objective function and constraints to embed the last hidden layer's activation function and the last linear layer
+    demand = weights[-1][0]
+    if model_type == 'coverage':
+        sense = GRB.MAXIMIZE
+        embed_modified_sigmoid(model, z, y)
+    elif model_type == 'p-median':
+        sense = GRB.MINIMIZE
+        # Don't need to introduce binary variables to embed last ReLU layer
+        model.addConstr(y >= 0)
+        model.addConstr(y >= z)
+    else:
+        raise ValueError("model_type must be 'coverage' or 'p-median'")
+    model.setObjective(demand@y, sense)
 
     # Limit total number of ambulances
     model.addConstr(x.sum() <= n_ambulances)
     
-    # Embed the MLP
+    # Embed everything up to the last hidden layer's activation function
     if use_gurobi_ml:
-        # Ideally we would pass mlp directly to add_sequential_constr(), but it doesn't like Dropout layers
-        sequential_model = nn.Sequential(*(layer for layer in mlp if not isinstance(layer, nn.Dropout)))
+        sequential_layers = []
+        for weight, bias in zip(weights[:-1], biases[:-1]):
+            linear = nn.Linear(weight.shape[1], weight.shape[0])
+            with torch.no_grad():
+                linear.weight.copy_(torch.tensor(weight))
+                linear.bias.copy_(torch.tensor(bias))
+            sequential_layers.extend([linear, nn.ReLU()])
+        sequential_layers.pop()  # Remove last ReLU
+        sequential_model = nn.Sequential(*sequential_layers)
         add_sequential_constr(model, sequential_model, x, z)
+        pass
     else:
-        M_minus, M_plus = calculate_bounds(weights, biases, n_ambulances)
-        embed_mlp(model, weights, biases, x, z, M_minus, M_plus, scale_relu=scale_relu)
-    embed_sigmoid(model, z, y)
+        M_minus, M_plus = calculate_bounds(weights[:-1], biases[:-1], n_ambulances)
+        embed_mlp(model, weights[:-1], biases[:-1], x, z, M_minus, M_plus, scale_relu)
 
     # Warm start
     if warm_start is not None:
@@ -476,99 +538,4 @@ def coverage_mlp(
 
     model.optimize()
     
-    return [int(x[j].X) for j in range(n_facilities)]
-
-def median_mlp(
-        demand: list[float],
-        mlp: MLP,
-        n_ambulances: int,
-        facility_capacity: Optional[int] = None,
-        use_gurobi_ml: bool = False,
-        scale_relu: bool = False,
-        warm_start: list[int] = None,
-        time_limit: float = None,
-        verbose: bool = False,
-    ) -> list[int]:
-    """Solve the Median-MLP model.
-
-    Parameters
-    ----------
-    demand : list[float]
-        Weight of each demand node.
-    
-    mlp : MLP
-        MLP predicting coverage probabilities given a solution.
-    
-    n_ambulances : int
-        Total number of ambulances.
-    
-    facility_capacity : int, optional
-        Maximum number of ambulances allowed at any facility.
-    
-    use_gurobi_ml : bool, optional
-        Use the Gurobi Machine Learning package to embed the MLP in the MIP model.
-    
-    scale_relu : bool, optional
-        How to model the ReLU activation function in the constraints. Ignored if use_gurobi_ml is True.
-        - If False, use the original approach seen in other papers.
-        - If True, scale the net inputs to ReLU units so that they are in [-1, 1], then rescale the outputs.
-    
-    warm_start : list[int], optional
-        Initial solution.
-    
-    time_limit : float, optional
-        Time limit in seconds.
-    
-    verbose : bool, optional
-        Print Gurobi output.
-    
-    Returns
-    -------
-    list[int]
-        Number of ambulances located at each facility.
-    """
-    if facility_capacity is None:
-        facility_capacity = n_ambulances
-    
-    linear_layers = [layer for layer in mlp if isinstance(layer, nn.Linear)]
-    weights = [layer.weight.detach().cpu().numpy() for layer in linear_layers]
-    biases = [layer.bias.detach().cpu().numpy() for layer in linear_layers]
-
-    model = gp.Model()
-    if time_limit is not None:
-        model.Params.TimeLimit = time_limit
-    model.Params.LogToConsole = verbose
-
-    n_demand_nodes = len(demand)
-    n_facilities = mlp[0].in_features
-
-    x = model.addMVar(n_facilities, lb=0, ub=facility_capacity, vtype=GRB.INTEGER)
-    y_mlp = model.addMVar(n_demand_nodes, lb=-GRB.INFINITY, ub=GRB.INFINITY, vtype=GRB.CONTINUOUS)
-    y = model.addMVar(n_demand_nodes, lb=0.0, ub=GRB.INFINITY, vtype=GRB.CONTINUOUS)
-
-    # Demand-weighted average distance
-    demand = np.array(demand, dtype=float)
-    demand /= demand.sum()  # Normalize so objective function is expected distance
-    model.setObjective(demand@y, GRB.MINIMIZE)
-
-    # Limit total number of ambulances
-    model.addConstr(x.sum() <= n_ambulances)
-    
-    # Embed the MLP
-    if use_gurobi_ml:
-        # Ideally we would pass mlp directly to add_sequential_constr(), but it doesn't like Dropout layers
-        sequential_model = nn.Sequential(*(layer for layer in mlp if not isinstance(layer, nn.Dropout)))
-        add_sequential_constr(model, sequential_model, x, y_mlp)
-    else:
-        M_minus, M_plus = calculate_bounds(weights, biases, n_ambulances)
-        embed_mlp(model, weights, biases, x, y_mlp, M_minus, M_plus, scale_relu=scale_relu)
-    model.addConstr(y >= y_mlp)
-
-    # Warm start
-    if warm_start is not None:
-        for j in range(n_facilities):
-            x[j].Start = warm_start[j]
-
-    model.optimize()
-    
-    return [int(x[j].X) for j in range(n_facilities)]
+    return np.rint(x.X).astype(int)

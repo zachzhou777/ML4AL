@@ -56,15 +56,15 @@ class EMSData:
     
     patients : pd.DataFrame
         Historical patient location data. Includes the following columns:
-        - x: UTM easting coordinate.
-        - y: UTM northing coordinate.
-        - demand_node: Demand node ID.
+        - x: UTM easting coordinate;
+        - y: UTM northing coordinate;
+        - demand_node: Demand node ID;
         - hospital: Nearest hospital ID.
     
     demand_nodes : pd.DataFrame
         Demand node locations. Includes the following columns:
-        - x: UTM easting coordinate.
-        - y: UTM northing coordinate.
+        - x: UTM easting coordinate;
+        - y: UTM northing coordinate;
         - demand: Number of patients assigned to the demand node.
     
     stations : pd.DataFrame

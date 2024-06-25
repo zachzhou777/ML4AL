@@ -15,7 +15,7 @@ if __name__ == '__main__':
                         help="Region ID (1 = Toronto, 4 = Muskoka)")
     parser.add_argument('--n_jobs', type=int, default=200,
                         help="Number of settings<Process>.csv files")
-    parser.add_argument('--n_replications', type=int, default=1,
+    parser.add_argument('--n_replications', type=int, default=3,
                         help="Number of replications per job")
     parser.add_argument('--results_dir', type=str, default='sim_results',
                         help="Directory containing results<Process>.csv files")
@@ -34,13 +34,11 @@ if __name__ == '__main__':
         raise ValueError("region_id not supported")
     
     sim_input_col_names = [f'solution_{i}' for i in range(n_stations)]
-    sim_output_col_names = sum([[f'n_covered_{i}', f'response_time_{i}', f'n_calls_from_{i}'] for i in range(n_demand_nodes)]
-                               + [[f'n_blocked_{j}', f'n_calls_to_{j}'] for j in range(n_stations)], [])
+    sim_output_col_names = sum([[f'n_covered_{i}', f'response_time_{i}', f'n_arrivals_{i}'] for i in range(n_demand_nodes)], [])
     coverage_col_names = [f'coverage_{i}' for i in range(n_demand_nodes)]
     avg_response_time_col_names = [f'avg_response_time_{i}' for i in range(n_demand_nodes)]
-    blocking_prob_col_names = [f'blocking_prob_{j}' for j in range(n_stations)]
     header = sim_input_col_names + sim_output_col_names
-    output_col_names = coverage_col_names + avg_response_time_col_names + blocking_prob_col_names
+    output_col_names = coverage_col_names + avg_response_time_col_names
 
     dataset = []
     for i in trange(args.n_jobs):
@@ -55,10 +53,8 @@ if __name__ == '__main__':
 
         # Compute coverage and avg_response_time columns, merge with station columns
         for i in range(n_demand_nodes):
-            output_cols[f'coverage_{i}'] = output_cols[f'n_covered_{i}'] / output_cols[f'n_calls_from_{i}']
-            output_cols[f'avg_response_time_{i}'] = output_cols[f'response_time_{i}'] / output_cols[f'n_calls_from_{i}']
-        for j in range(n_stations):
-            output_cols[f'blocking_prob_{j}'] = output_cols[f'n_blocked_{j}'] / output_cols[f'n_calls_to_{j}']
+            output_cols[f'coverage_{i}'] = output_cols[f'n_covered_{i}'] / output_cols[f'n_arrivals_{i}']
+            output_cols[f'avg_response_time_{i}'] = output_cols[f'response_time_{i}'] / output_cols[f'n_arrivals_{i}']
         agg_results = pd.concat([station_cols, output_cols[output_col_names]], axis=1)
 
         dataset.append(agg_results)
