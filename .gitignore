@@ -2,6 +2,5 @@ __pycache__/
 *.pkl
 *.pt
 data/
-dataset*.csv
 test*
 sim*/
