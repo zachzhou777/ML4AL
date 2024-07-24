@@ -7,6 +7,26 @@ from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import train_test_split
 from tqdm import trange
 
+class PositiveLinear(nn.Module):
+    """A linear layer where the weights are positive.
+
+    Source: https://discuss.pytorch.org/t/positive-weights/19701/7
+    """
+    def __init__(self, in_features: int, out_features: int):
+        super(PositiveLinear, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.log_weight = nn.Parameter(torch.empty(self.out_features, self.in_features))
+        self.bias = nn.Parameter(torch.empty(self.out_features))
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.log_weight)
+        nn.init.zeros_(self.bias)
+    
+    def forward(self, input):
+        return F.linear(input, self.log_weight.exp(), self.bias)
+
 class ModifiedSigmoid(nn.Module):
     """A function that returns sigmoid(z) for z > 0, 0.25 * z + 0.5
     otherwise.
@@ -19,19 +39,16 @@ class ModifiedSigmoid(nn.Module):
 
 class MLP(nn.Sequential):
     """Multilayer perceptron for predicting an ambulance location
-    performance metric (coverage or average response time).
+    performance metric.
 
     The model takes an allocation of ambulances to facilities as input,
     and produces a single metric.
 
     All hidden layers except the last use the ReLU activation function.
-    If the MLP predicts coverage, then the last hidden layer uses the
+    If the MLP predicts coverage, then the final hidden layer uses the
     ModifiedSigmoid activation function. Otherwise if the MLP predicts
-    average response time, then the last hidden layer uses the ReLU
+    average response time, then the final hidden layer uses the ReLU
     activation function.
-
-    TODO: How does this compare to traditional MLP for regression (no
-    demand-weighting, last linear layer is learnable, use only ReLUs)?
 
     Parameters
     ----------
@@ -39,26 +56,16 @@ class MLP(nn.Sequential):
         Number of input features (facilities).
     
     hidden_dims : list[int]
-        Sizes of hidden layers (excluding last hidden layer which
-        corresponds to demand nodes).
+        Sizes of hidden layers.
     
-    demand : np.ndarray
-        Demand weights. The last linear layer is frozen and implements
-        demand-weighting (weights = demand, biases = 0). Normalized to
-        sum to 1 before use.
+    final_hidden_activation : nn.Module, optional
+        Activation function for the final hidden layer. Defaults to ReLU.
     
-    model_type : {'coverage', 'p-median'}
-        Metric to predict ('coverage' for coverage, 'p-median' for
-        average response time).
+    positive_final_weights : bool, optional
+        Whether to use positive weights for the final linear layer.
     
-    dropout, dropout_decay_rate : float, optional
-        Dropout probability and decay rate.
-
-        Dropout is applied to hidden layers. We support annealed dropout
-        where the dropout probability decreases by dropout_decay_rate
-        every epoch until it reaches zero.
-
-        Annealed dropout paper: https://doi.org/10.1109/SLT.2014.7078567
+    dropout : float, optional
+        Dropout probability.
     
     loss_fn : Callable[[torch.Tensor, torch.Tensor], torch.Tensor], optional
         Loss function to apply to predictions and targets.
@@ -110,15 +117,6 @@ class MLP(nn.Sequential):
     
     Attributes
     ----------
-    dropout, dropout_decay_rate : float
-        Dropout probability and decay rate.
-
-        Dropout is applied to hidden layers. We support annealed dropout
-        where the dropout probability decreases by dropout_decay_rate
-        every epoch until it reaches zero.
-
-        Annealed dropout paper: https://doi.org/10.1109/SLT.2014.7078567
-
     loss_fn : Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
         Loss function to apply to predictions and targets.
     
@@ -159,57 +157,39 @@ class MLP(nn.Sequential):
         self,
         in_dim: int,
         hidden_dims: list[int],
-        demand: np.ndarray,
-        model_type: str,
+        final_hidden_activation: Optional[nn.Module] = None,
+        positive_final_weights: bool = True,
         dropout: float = 0.3,
-        dropout_decay_rate: float = 0.005,
         loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = F.mse_loss,
         optimizer: type[torch.optim.Optimizer] = torch.optim.Adam,
         optimizer_params: Optional[dict[str, Any]] = None,
         lr_scheduler: Optional[type[torch.optim.lr_scheduler.LRScheduler]] = None,
         lr_scheduler_params: Optional[dict[str, Any]] = None,
         batch_size: int = 128,
-        max_epochs: int = 200,
-        validation_fraction: float = 0.1,
+        max_epochs: int = 100,
+        validation_fraction: float = 0.2,
         rel_tol: float = 1e-4,
         abs_tol: float = 0.0,
         patience: int = 20,
         name: str = 'model',
         verbose: bool = True
     ):
-        # Normalize demand to sum to 1
-        demand = np.array(demand, dtype=float)
-        demand /= demand.sum()
-        n_demand_nodes = demand.shape[0]
-
-        # Construct model
+        if final_hidden_activation is None:
+            final_hidden_activation = nn.ReLU()
         layers = []
-        for hidden_dim in hidden_dims:
+        for i, hidden_dim in enumerate(hidden_dims):
             layers.append(nn.Linear(in_dim, hidden_dim))
-            layers.append(nn.ReLU())
+            layers.append(nn.ReLU() if i < len(hidden_dims) - 1 else final_hidden_activation)
             layers.append(nn.Dropout(dropout))
             in_dim = hidden_dim
-        layers.append(nn.Linear(hidden_dims[-1], n_demand_nodes))
-        if model_type == 'coverage':
-            last_hidden_activation = ModifiedSigmoid()
-        elif model_type == 'p-median':
-            last_hidden_activation = nn.ReLU()
-        else:
-            raise ValueError("model_type must be 'coverage' or 'p-median'")
-        layers.append(last_hidden_activation)
-        # Because last linear layer is frozen, don't apply dropout to last hidden layer
-        last_linear_layer = nn.Linear(n_demand_nodes, 1)
+        last_linear_layer = (
+            PositiveLinear(hidden_dims[-1], 1) if positive_final_weights
+            else nn.Linear(hidden_dims[-1], 1)
+        )
         layers.append(last_linear_layer)
         super().__init__(*layers)
 
-        # Freeze last linear layer to implement demand-weighting
-        last_linear_layer.weight.data = torch.tensor(demand.reshape(1, -1), dtype=torch.float32)
-        nn.init.zeros_(last_linear_layer.bias)
-        last_linear_layer.requires_grad_(False)
-
         # Set attributes
-        self.dropout = dropout
-        self.dropout_decay_rate = dropout_decay_rate
         self.loss_fn = loss_fn
         self.optimizer = optimizer(self.parameters(), **(optimizer_params or {}))
         self.lr_scheduler = None
@@ -234,11 +214,15 @@ class MLP(nn.Sequential):
     
     def save_npz(self):
         """Save model parameters to .npz file."""
+        # Doesn't include PositiveLinear if that's the last layer
         linear_layers = [layer for layer in self if isinstance(layer, nn.Linear)]
         weights_and_biases = {}
         for i, layer in enumerate(linear_layers):
             weights_and_biases[f'weight_{i}'] = layer.weight.detach().cpu().numpy()
             weights_and_biases[f'bias_{i}'] = layer.bias.detach().cpu().numpy()
+        if isinstance(self[-1], PositiveLinear):
+            weights_and_biases[f'weight_{len(linear_layers)}'] = self[-1].log_weight.exp().detach().cpu().numpy()
+            weights_and_biases[f'bias_{len(linear_layers)}'] = self[-1].bias.detach().cpu().numpy()
         np.savez(f'{self.name}.npz', **weights_and_biases)
     
     @staticmethod
@@ -262,17 +246,13 @@ class MLP(nn.Sequential):
         return weights, biases
     
     def set_dropout(self, dropout: float):
-        """Set a new dropout probability.
-
-        Not as simple as just setting self.dropout, also need to update
-        p attribute of Dropout layers.
+        """Set dropout probability.
 
         Parameters
         ----------
         dropout : float
             New dropout probability.
         """
-        self.dropout = dropout
         for layer in self:
             if isinstance(layer, nn.Dropout):
                 layer.p = dropout
@@ -326,7 +306,8 @@ class MLP(nn.Sequential):
         y_train = y_train.view(-1, 1)
         dataset = TensorDataset(X_train, y_train)
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
-        best_val_loss = float('inf')
+        best_val_loss = self.loss_fn(self.predict(X_val), y_val).item()
+        no_improvement_count = 0
         pbar = trange(self.max_epochs, unit="epoch", disable=not self.verbose)
         for _ in pbar:
             train_loss = 0.0
@@ -344,8 +325,6 @@ class MLP(nn.Sequential):
             val_loss = self.loss_fn(self.predict(X_val), y_val).item()
             # If validation loss improves, save checkpoint
             threshold = max(self.rel_tol * abs(best_val_loss), self.abs_tol)
-            if threshold == float('inf'):  # True only on first epoch
-                threshold = 0
             if best_val_loss - val_loss > threshold:
                 no_improvement_count = 0
                 best_val_loss = val_loss
@@ -364,9 +343,6 @@ class MLP(nn.Sequential):
                     self.lr_scheduler.step(val_loss)
                 else:
                     self.lr_scheduler.step()
-            # Update dropout probability
-            if self.dropout > 0 and self.dropout_decay_rate > 0:
-                self.set_dropout(max(0, self.dropout - self.dropout_decay_rate))
             # Update progress bar message
             pbar.set_postfix(train_loss=train_loss, val_loss=val_loss, best_val_loss=best_val_loss)
         # Load best checkpoint

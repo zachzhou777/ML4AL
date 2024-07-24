@@ -1,23 +1,36 @@
 import math
 import heapq
-import random
-import pickle
 import collections
+import warnings
 import numpy as np
 import pandas as pd
+import scipy
+import scipy.spatial
 from typing import TYPE_CHECKING
-
 if TYPE_CHECKING:
     from ems_data import EMSData
 
-# Event.type values
-ARRIVAL = 0
-RETURN = 1
+# Ratio of driving distance to straight-line distance
+# Source: https://doi.org/10.1080/00330124.2011.583586
+DETOUR_INDEX = 1.417
+
+METRICS = [
+    'coverage_9min',
+    'coverage_15min',
+    'survival_rate',
+    'response_time_mean',
+    'response_time_median',
+    'response_time_90th_percentile',
+    'busy_fraction',
+    'service_rate'
+]
 
 class Event:
-    """An event in the simulation. Can represent either an arrival or an ambulance return."""
-    def __init__(self, type: int, time: float, id: int):
-        self.type = type  # Either ARRIVAL or RETURN
+    """An event in the simulation. Can represent either an arrival or an
+    ambulance return.
+    """
+    def __init__(self, type: str, time: float, id: int):
+        self.type = type  # Either 'arrival' or 'return'
         self.time = time  # Time of event
         self.id = id  # Patient ID or station ID
     
@@ -30,208 +43,106 @@ class Simulation:
 
     Parameters
     ----------
-    data : EMSData
+    ems_data : EMSData
         Data for the simulation.
-    
-    avg_calls_per_day : int
-        Average number of calls per day, a.k.a. the arrival rate.
-    
-    remove_outliers : bool, optional
-        Whether to remove outliers when sampling travel times and support times.
+
+        To keep Simulation instance lightweight, we extract only the
+        necessary attributes from EMSData.
     
     n_days : int, optional
         Duration of a run.
     
     n_replications : int, optional
-        Number of times to replicate simulation for a given solution.
+        Number of times to replicate simulation.
+    
+    outlier_fraction : float, optional
+        Fraction of pre-travel delay, travel time, and support time
+        distributions to remove from consideration when sampling.
+
+        The t-distribution can produce extreme outliers, so for
+        simulation, it makes sense to truncate it. We remove the
+        outlier_fraction/2 smallest and largest values from the
+        distribution.
+
+        The support time empirical distribution has a long right tail,
+        so we remove the outlier_fraction largest values.
+    
+    seed : int | None, optional
+        Random seed.
     
     Attributes
     ----------
-    response_time_threshold : float
-        Response time threshold in minutes.
-    
-    patients : pd.DataFrame
-        Historical patient location data. Includes columns 'demand_node' and 'hospital'.
-    
-    n_demand_nodes : int
-        Number of demand nodes.
-    
-    support_times : list[float]
-        Historical support (scene, transfer, and turnover) times in minutes. Outliers (top 1%) are removed if remove_outliers is True.
-    
-    arrival_times : list[int]
-        Historical arrival times, given as the exact minute of the day (e.g., 60*8 + 30 for 8:30 AM).
-    
-    median_response_times : np.ndarray of shape (n_stations, n_patients)
-        median_response_times[i, j] is the median travel time in minutes from station i to patient j.
-    
-    median_transport_times : np.ndarray of shape (n_patients,)
-        median_transport_times[i] is the median travel time in minutes from patient i to their hospital.
-    
-    median_return_times : np.ndarray of shape (n_hospitals, n_stations)
-        median_return_times[i, j] is the median travel time in minutes from hospital i to station j.
-    
-    dispatch_order : np.ndarray of shape (n_patients, n_stations)
-        dispatch_order[i] is the station IDs sorted by increasing travel time to patient i.
-    
-    avg_calls_per_day : int
-        Average number of calls per day.
-    
-    remove_outliers : bool
-        Whether to remove outliers when sampling travel times and support times.
-    
     n_days : int
         Duration of a run.
     
     n_replications : int
         Number of times to replicate simulation.
+    
+    outlier_fraction : float
+        Fraction of pre-travel delay, travel time, and support time
+        distributions to remove from consideration when sampling.
     """
+    _VARS_TO_PICKLE = [
+        'n_days',
+        'n_replications',
+        'outlier_fraction',
+        '_seed',
+        '_patients',
+        '_stations',
+        '_hospitals',
+        '_nonemergent_factor',
+        '_arrival_times',
+        '_support_times',
+        '_avg_calls_per_day'
+    ]
+
     def __init__(
         self,
-        data: 'EMSData',
-        avg_calls_per_day: int,
-        remove_outliers: bool = True,
+        ems_data: 'EMSData',
         n_days: int = 100,
-        n_replications: int = 1
+        n_replications: int = 1,
+        outlier_fraction: float = 0.01,
+        seed: int | None = None
     ):
-        # To keep Simulation instance lightweight, extract only necessary attributes from EMSData
-        self.response_time_threshold = data.response_time_threshold
-        self.patients = data.patients[['demand_node', 'hospital']]
-        self.n_demand_nodes = len(data.demand_nodes)
-        support_times = data.support_times
-        if remove_outliers:
-            support_times = np.array(support_times)
-            support_times = support_times[support_times < np.percentile(support_times, 99)]
-            support_times = support_times.tolist()
-        self.support_times = support_times
-        self.arrival_times = data.arrival_times
-        self.median_response_times = data.median_response_times
-        self.median_transport_times = data.median_transport_times
-        self.median_return_times = data.median_return_times
-        self.dispatch_order = data.dispatch_order
-
-        self.avg_calls_per_day = avg_calls_per_day
-        self.remove_outliers = remove_outliers
+        # Attributes saved during pickling
         self.n_days = n_days
         self.n_replications = n_replications
-    
-    def save_instance(self, filename: str):
-        """Dump Simulation instance to a pickle file."""
-        with open(filename, 'wb') as f:
-            pickle.dump(self, f)
-    
-    @classmethod
-    def load_instance(cls, filename: str) -> 'Simulation':
-        """Load Simulation instance from a pickle file."""
-        with open(filename, 'rb') as f:
-            instance = pickle.load(f)
-        return instance
-    
-    @staticmethod
-    def _sample_t_distribution(df: float, retry_if_outlier: bool = True) -> float:
-        """Sample from a t-distribution with df degrees of freedom.
+        self.outlier_fraction = outlier_fraction
+        self._seed = seed
+        self._patients = ems_data.patients
+        self._stations = ems_data.stations
+        self._hospitals = ems_data.hospitals
+        self._nonemergent_factor = ems_data.nonemergent_factor
+        self._arrival_times = ems_data.arrival_times
+        self._support_times = ems_data.support_times
+        self._avg_calls_per_day = ems_data.avg_calls_per_day
 
-        Variance of t-distribution infinity or undefined for df <= 2, so only allow df > 2.
-
-        The t-distribution can produce extreme values, so this function allows for retrying if an outlier is sampled.
+        # Attributes not saved during pickling
+        self._precompute_simulation_data()
+        self._rng = np.random.default_rng(seed)
+    
+    def __getstate__(self) -> dict:
+        """When pickling, only save necessary attributes."""
+        return {var: getattr(self, var) for var in Simulation._VARS_TO_PICKLE}
+    
+    def __setstate__(self, state: dict):
+        """When unpickling, restore attributes, including those not
+        saved during pickling.
         """
-        if df <= 2:
-            raise ValueError("df must be greater than 2")
-        if retry_if_outlier:
-            # Try 3 times before giving up and returning 0
-            for _ in range(3):
-                eps = np.random.standard_t(df=df)
-                if np.abs(eps) < 3*math.sqrt(df/(df-2)):  # Check if within 3 std devs
-                    return eps
-            return 0
-        return np.random.standard_t(df=df)
-
-    @staticmethod
-    def sample_pretravel_delay(
-            zero_prob: float = 0.0055,
-            mu: float = 4.68,
-            sigma: float = 0.38,
-            tau: float = 5.37,
-            retry_if_outlier: bool = True
-        ) -> float:
-        """Sample pre-travel delay.
-
-        Original paper: https://doi.org/10.1287/mnsc.1090.1142
-
-        Parameters
-        ----------
-        zero_prob : float, optional
-            Discrete probability of zero pre-travel delay.
-        
-        mu, sigma : float, optional
-            Parameters for nonzero part of the mixture. See original paper.
-        
-        tau : float, optional
-            Degrees of freedom for t-distribution.
-        
-        retry_if_outlier : bool, optional
-            Whether to retry if an outlier is sampled.
-
-        Returns
-        -------
-        float
-            Pre-travel delay in minutes.
-        """
-        if np.random.binomial(n=1, p=zero_prob):
-            return 0
-        eps = Simulation._sample_t_distribution(df=tau, retry_if_outlier=retry_if_outlier)
-        pretravel_delay = math.exp(mu + sigma*eps)
-        pretravel_delay /= 60  # Convert to minutes
-        return pretravel_delay
-
-    @staticmethod
-    def sample_travel_time(
-            median: float,
-            b_0: float = 0.336,
-            b_1: float = 0.000058,
-            b_2: float = 0.0388,
-            tau: float = 4.0,
-            retry_if_outlier: bool = True
-        ) -> float:
-        """Sample travel time given median.
-
-        The t-distribution can produce extreme values, so this function allows for retrying if an outlier is sampled.
-        
-        Original paper: https://doi.org/10.1287/mnsc.1090.1142
-
-        Parameters
-        ----------
-        median : float
-            Median travel time in minutes.
-        
-        b_0, b_1, b_2 : float, optional
-            Used to calculate coefficient of variation. See original paper.
-        
-        tau : float, optional
-            Degrees of freedom for t-distribution.
-        
-        retry_if_outlier : bool, optional
-            Whether to retry if an outlier is sampled.
-        
-        Returns
-        -------
-        float
-            Travel time in minutes.
-        """
-        cv = math.sqrt(b_0*(b_2 + 1) + b_1*(b_2 + 1)*median + b_2*median**2)/median
-        eps = Simulation._sample_t_distribution(df=tau, retry_if_outlier=retry_if_outlier)
-        travel_time = median*math.exp(cv*eps)
-        return travel_time
+        self.__dict__.update(state)
+        self._precompute_simulation_data()
+        self._rng = np.random.default_rng(self._seed)
     
-    def run_single_replication(self, solution: list[int]) -> pd.DataFrame:
-        """Run a replication of the simulation using a given solution.
-        
-        When recording response times, we exclude pre-travel delay
-        because it is independent of the solution; we only account for
-        the travel time from the station to the patient, and any
-        additional time the patient must wait if all ambulances in the
-        system are busy. When evaluating coverage, we include pre-travel
-        delay.
+    def run(self, solution: list[int]) -> pd.DataFrame:
+        """Run multiple replications of the simulation using a given
+        solution.
+
+        The response time metrics we report do not include pre-travel
+        delay because it is just noise independent of the solution; we
+        only include the time spent waiting for an ambulance to become
+        available if all are busy, and the travel time from the station
+        to the patient. When evaluating coverage and survival rate, we
+        do include pre-travel delay.
 
         Parameters
         ----------
@@ -240,70 +151,369 @@ class Simulation:
         
         Returns
         -------
-        pd.DataFrame of shape (1, 3*n_demand_nodes)
-            Contains the following columns for each demand node i:
-            - n_covered_<i>: Number of arrivals covered within the response time threshold
-            - response_time_<i>: Total response time (excluding pre-travel delay), summed over all arrivals
-            - n_arrivals_<i>: Total number of arrivals
+        pd.DataFrame of shape (n_replications, 8)
+            Contains the following columns:
+            - coverage_9min: Fraction of calls covered within 9 minutes
+            - coverage_15min: Fraction of calls covered within 15
+              minutes
+            - survival_rate: Fraction of patients who survive to
+              hospital discharge
+            - response_time_mean: Mean response time in minutes
+            - response_time_median: Median response time in minutes
+            - response_time_90th_percentile: 90th percentile of response
+              in minutes
+            - busy_fraction: Fraction of time an ambulance is busy on
+              average
+            - service_rate: Service rate in calls per day
         """
-        # Tracks number of available ambulances at each station throughout the simulation
-        self._available_ambulances = list(solution)
+        results = [
+            self.run_single_replication(solution)
+            for _ in range(self.n_replications)
+        ]
+        results = pd.concat(results, ignore_index=True)
+        return results
+    
+    def run_single_replication(self, solution: list[int]) -> pd.DataFrame:
+        """Run a single replication of the simulation using a given
+        solution.
+
+        Parameters
+        ----------
+        solution : list[int]
+            Number of ambulances located at each facility.
+        
+        Returns
+        -------
+        pd.DataFrame of shape (1, 8)
+            Contains the following columns:
+            - coverage_9min: Fraction of calls covered within 9 minutes
+            - coverage_15min: Fraction of calls covered within 15
+              minutes
+            - survival_rate: Fraction of patients who survive to
+              hospital discharge
+            - response_time_mean: Mean response time in minutes
+            - response_time_median: Median response time in minutes
+            - response_time_90th_percentile: 90th percentile of response
+              in minutes
+            - busy_fraction: Fraction of time an ambulance is busy on
+              average
+            - service_rate: Service rate in calls per day
+        """
+        # Generate arrival data up front
+        # Arrival times and patient IDs
+        arrivals = self._sample_arrivals()
+        if not arrivals:
+            warnings.warn("No arrivals during simulation, all metrics are NaN")
+            return pd.DataFrame([{metric: np.nan for metric in METRICS}])
+        # Pre-travel delays
+        self._pretravel_delay_samples = (
+            self.sample_pretravel_delay(size=len(arrivals))
+        )
+        # t-distribution samples for travel times
+        self._travel_time_eps_samples = (
+            self.sample_truncated_t_distribution(df=4.0, size=(len(arrivals), 3))
+        )
+        # Support times
+        support_times = self._support_times
+        outlier_threshold = np.quantile(support_times, 1 - self.outlier_fraction)
+        support_times = support_times[support_times <= outlier_threshold]
+        self._support_time_samples = self._rng.choice(support_times, size=len(arrivals))
+
+        # Initialize data structures for simulation
+        # For each arrival, log response time and busy time
+        self._response_times = np.empty(len(arrivals))
+        self._total_busy_time = 0
+        # Index for pre-generated values and response times log
+        self._dispatch_idx = 0
+        # Track available ambulances at each station throughout simulation
+        self._available_ambulances = np.rint(solution)
         # Priority queue of events (arrivals and returns)
-        arrivals = self._create_arrivals()
         heapq.heapify(arrivals)
         self._event_queue = arrivals
         # FIFO queue patients must wait in if no ambulances are available
         self._fifo_queue = collections.deque()
 
-        # Log results in self._results array, use self._col2idx to map column names to indices
-        cols = sum([[f'n_covered_{i}', f'response_time_{i}', f'n_arrivals_{i}'] for i in range(self.n_demand_nodes)], [])
-        self._col2idx = {col: idx for idx, col in enumerate(cols)}
-        self._results = np.zeros(len(cols))
-
-        # Run simulation, self._results is updated as simulation progresses
+        # Run simulation
         while self._event_queue:
             event = heapq.heappop(self._event_queue)
-            if event.type == ARRIVAL:
+            if event.type == 'arrival':
                 self._process_arrival(event)
-            elif event.type == RETURN:
+            elif event.type == 'return':
                 self._process_return(event)
-        
-        # Convert results to DataFrame
-        self._results = pd.DataFrame(self._results.reshape(1, -1), columns=cols)
-        self._results = self._results.astype({col: int for col in cols if col.startswith('n_')})
+        # Last event is a return, its time is the end of the simulation
+        self._simulation_duration = event.time
 
-        return self._results
+        # Compute metrics
+        metrics = self._compute_metrics()
+        metrics = pd.DataFrame([metrics])
+
+        return metrics
     
-    def _create_arrivals(self) -> list[Event]:
-        """Create all arrivals for a run up front."""
-        arrival_times = []
-        arrival_patient_ids = []
+    def _compute_metrics(self) -> dict[str, float]:
+        """Compute metrics for the simulation."""
+        n_ambulances = np.sum(self._available_ambulances)
+        n_arrivals = self._response_times.shape[0]
+        total_response_times = self._pretravel_delay_samples + self._response_times
+        coverage_9min = np.mean(total_response_times < 9)
+        coverage_15min = np.mean(total_response_times < 15)
+        survival_rate = np.mean(Simulation.survival_function(total_response_times))
+        response_time_mean = np.mean(self._response_times)
+        response_time_median = np.median(self._response_times)
+        response_time_90th_percentile = np.percentile(self._response_times, 90)
+        busy_fraction = (
+            self._total_busy_time / (n_ambulances * self._simulation_duration)
+        )
+        avg_time_per_call = self._total_busy_time / n_arrivals
+        service_rate = 60*24 / avg_time_per_call
+        metrics = {
+            'coverage_9min': coverage_9min,
+            'coverage_15min': coverage_15min,
+            'survival_rate': survival_rate,
+            'response_time_mean': response_time_mean,
+            'response_time_median': response_time_median,
+            'response_time_90th_percentile': response_time_90th_percentile,
+            'busy_fraction': busy_fraction,
+            'service_rate': service_rate
+        }
+        # Sanity check in case of future changes
+        assert set(metrics.keys()) == set(METRICS)
+        return metrics
+
+    def sample_pretravel_delay(
+        self,
+        size: int | tuple[int] | None = None
+    ) -> float | np.ndarray:
+        """Sample pre-travel delay.
+
+        Source: https://doi.org/10.1287/mnsc.1090.1142
+
+        Parameters
+        ----------
+        size : int | tuple[int] | None, optional
+            Output shape.
+
+        Returns
+        -------
+        float | np.ndarray
+            Pre-travel delay in minutes.
+        """
+        log_pretravel_delay = (
+            self.sample_truncated_t_distribution(5.37, 4.68, 0.38, size)
+        )
+        pretravel_delay = np.exp(log_pretravel_delay)
+        pretravel_delay *= self._rng.binomial(1, 0.9945, size)
+        return pretravel_delay / 60  # Convert to minutes
+    
+    def sample_travel_time(
+        self,
+        distance: float | np.ndarray,
+        size: int | tuple[int] | None = None
+    ) -> float | np.ndarray:
+        """Sample travel time.
+
+        We won't call this method during the simulation because it's too
+        slow to sample as we go, and we also can't easily pre-sample
+        travel times because we don't know up front what distances we
+        will need samples for. Instead, we precompute the median and cv
+        parameters for all possible pairs of locations, pre-generate
+        t-distribution samples, and use these to calculate travel times
+        on the fly.
+
+        Source: https://doi.org/10.1287/mnsc.1090.1142
+
+        Parameters
+        ----------
+        distance : float | np.ndarray
+            Distance in kilometers.
+        
+        size : int | tuple[int] | None, optional
+            Output shape.
+        
+        Returns
+        -------
+        float | np.ndarray
+            Travel time in minutes.
+        """
+        distance = np.array(distance)
+        if size is None:
+            size = distance.shape
+        median, cv = Simulation._compute_travel_time_median_cv(distance)
+        eps = self.sample_truncated_t_distribution(4.0, size=size)
+        return median*np.exp(cv*eps)
+    
+    def sample_truncated_t_distribution(
+        self,
+        df: float | np.ndarray,
+        loc: float | np.ndarray = 0.0,
+        scale: float | np.ndarray = 1.0,
+        size: int | tuple[int] | None = None
+    ) -> float | np.ndarray:
+        """Sample from a truncated t-distribution.
+
+        Parameters
+        ----------
+        df : float | np.ndarray
+            Degrees of freedom.
+        
+        loc, scale : float | np.ndarray, optional
+            Location and scale parameters.
+        
+        size : int | tuple[int] | None, optional
+            Output shape.
+        
+        Returns
+        -------
+        float | np.ndarray
+            Drawn samples from the truncated t-distribution.
+        """
+        if size is None:
+            size = np.broadcast(df, loc, scale).shape
+        q = self._rng.uniform(
+            self.outlier_fraction/2,
+            1 - self.outlier_fraction/2,
+            size
+        )
+        return scipy.stats.t.ppf(q, df, loc, scale)
+    
+    @staticmethod
+    def driving_distance(
+        X: np.ndarray,
+        Y: np.ndarray
+    ) -> np.ndarray:
+        """Compute driving distance between pairs of points.
+
+        Parameters
+        ----------
+        X : np.ndarray of shape (m, 2)
+            UTM coordinates of the first set of points.
+        
+        Y : np.ndarray of shape (n, 2)
+            UTM coordinates of the second set of points.
+        
+        Returns
+        -------
+        np.ndarray of shape (m, n)
+            Driving distance in kilometers between each pair of points.
+        """
+        return (
+            scipy.spatial.distance.cdist(X, Y)  # Straight-line distance
+            * DETOUR_INDEX  # Convert to driving distance
+            / 1000  # Convert to kilometers
+        )
+    
+    @staticmethod
+    def survival_function(
+        response_time: float | np.ndarray
+    ) -> float | np.ndarray:
+        """Estimate survival probability as a function of response time.
+
+        "Survival" means "survival to hospital discharge."
+
+        Original paper: https://doi.org/10.1067/mem.2003.266
+        
+        Parameters
+        ----------
+        response_time : float | np.ndarray
+            Response time in minutes.
+        
+        Returns
+        -------
+        float | np.ndarray
+            Estimated survival probability.
+        """
+        # Ignore overflow, happens if response time is large, result ends up being 0 anyway
+        with warnings.catch_warnings(action='ignore', category=RuntimeWarning):
+            return 1/(1 + np.exp(0.679 + 0.262*np.array(response_time)))
+    
+    def _precompute_simulation_data(self):
+        """Using locations of stations, patients, and hospitals,
+        precompute attributes used during simulation.
+        """
+        # Compute driving distances
+        response_distances = Simulation.driving_distance(self._stations, self._patients)
+        transport_distances = Simulation.driving_distance(self._patients, self._hospitals)
+        return_distances = Simulation.driving_distance(self._hospitals, self._stations)
+
+        # For each patient, sort stations by proximity
+        self._dispatch_order = response_distances.T.argsort(axis=1)
+
+        # Assign patients to hospitals, keep only the distance to the assigned hospital
+        self._patient_to_hospital = transport_distances.argmin(axis=1)
+        transport_distances = transport_distances[
+            np.arange(transport_distances.shape[0]),
+            self._patient_to_hospital
+        ]
+
+        # Compute travel time median and cv parameters
+        self._response_median, self._response_cv = (
+            Simulation._compute_travel_time_median_cv(response_distances)
+        )
+        self._transport_median, self._transport_cv = (
+            Simulation._compute_travel_time_median_cv(transport_distances)
+        )
+        self._return_median, self._return_cv = (
+            Simulation._compute_travel_time_median_cv(return_distances)
+        )
+        self._return_median *= self._nonemergent_factor
+    
+    @staticmethod
+    def _compute_travel_time_median_cv(
+        distance: float | np.ndarray,
+        a: float = 41.0/60,
+        v_c: float = 100.7/60,
+        b_0: float = 0.336,
+        b_1: float = 0.000058,
+        b_2: float = 0.0388
+    ) -> tuple[float, float] | tuple[np.ndarray, np.ndarray]:
+        """Compute travel time median and cv parameters for a given
+        distance in kilometers.
+        """
+        d_c = v_c**2 / (2*a)
+        median = np.where(
+            distance <= 2*d_c,
+            2*np.sqrt(distance)/math.sqrt(a),
+            v_c/a + distance/v_c
+        )
+        cv = np.sqrt(b_0*(b_2 + 1) + b_1*(b_2 + 1)*median + b_2*median**2)/median
+        return median, cv
+    
+    def _sample_arrivals(self) -> list[Event]:
+        """Sample all arrivals for the simulation up front."""
+        times = []
+        patient_ids = []
+        n_patients = len(self._patient_to_hospital)
 
         # Sample number of calls for each day
-        for day, n_calls in enumerate(np.random.poisson(self.avg_calls_per_day, self.n_days)):
+        for day, n_calls in enumerate(
+            self._rng.poisson(self._avg_calls_per_day, self.n_days)
+        ):
             # Sample arrival times
-            arrival_times_today = random.sample(self.arrival_times, n_calls)
-            arrival_times += (np.array(arrival_times_today) + 60*24*day).tolist()
+            times_today = self._rng.choice(self._arrival_times, n_calls)
+            times.extend(times_today + 60*24*day)
             # Sample patient IDs
-            arrival_patient_ids += random.sample(self.patients.index.tolist(), n_calls)
+            patient_ids.extend(self._rng.choice(n_patients, n_calls))
         
         # Create Events
-        arrivals = [Event(ARRIVAL, t, i) for t, i in zip(arrival_times, arrival_patient_ids)]
+        arrivals = [Event('arrival', t, i) for t, i in zip(times, patient_ids)]
 
         return arrivals
     
     def _process_arrival(self, event: Event):
-        """Dispatch the nearest ambulance; if there are no available ambulances, add patient to FIFO queue."""
+        """Dispatch the nearest ambulance; if there are no available
+        ambulances, add patient to FIFO queue.
+        """
         current_time = event.time
         patient_id = event.id
-        for station_id in self.dispatch_order[patient_id]:
+        for station_id in self._dispatch_order[patient_id]:
             if self._available_ambulances[station_id] > 0:
                 self._dispatch(station_id, patient_id, current_time, current_time)
                 return
         self._fifo_queue.append((patient_id, current_time))
     
     def _process_return(self, event: Event):
-        """Increment ambulance count. If FIFO queue nonempty, dispatch ambulance."""
+        """Increment ambulance count. If FIFO queue nonempty, dispatch
+        the ambulance that just returned immediately.
+        """
         current_time = event.time
         station_id = event.id
         self._available_ambulances[station_id] += 1
@@ -311,49 +521,54 @@ class Simulation:
         if self._fifo_queue:
             patient_id, arrival_time = self._fifo_queue.popleft()
             self._dispatch(station_id, patient_id, current_time, arrival_time)
-
-    def _dispatch(self, station_id: int, patient_id: int, current_time: float, arrival_time: float):
-        """Decrement ambulance count, sample random times, create return Event, and record metrics."""
+    
+    def _dispatch(
+        self,
+        station_id: int,
+        patient_id: int,
+        current_time: float,
+        arrival_time: float
+    ):
+        """Decrement ambulance count, sample random times, create return
+        Event, and record metrics.
+        """
         # Decrement ambulance count
         self._available_ambulances[station_id] -= 1
 
-        # Sample random times
-        pretravel_delay = Simulation.sample_pretravel_delay(retry_if_outlier=self.remove_outliers)
-        response_travel_time = Simulation.sample_travel_time(self.median_response_times[station_id, patient_id], retry_if_outlier=self.remove_outliers)
-        transport_time = Simulation.sample_travel_time(self.median_transport_times[patient_id], retry_if_outlier=self.remove_outliers)
-        return_time = Simulation.sample_travel_time(self.median_return_times[self.patients.hospital[patient_id], station_id], retry_if_outlier=self.remove_outliers)
-        support_time = random.choice(self.support_times)
+        # Sample random times (by pulling from pre-generated data)
+        pretravel_delay = self._pretravel_delay_samples[self._dispatch_idx]
+        eps = self._travel_time_eps_samples[self._dispatch_idx]
+        support_time = self._support_time_samples[self._dispatch_idx]
+
+        median = self._response_median[station_id, patient_id]
+        cv = self._response_cv[station_id, patient_id]
+        response_time = median*math.exp(cv*eps[0])
+
+        median = self._transport_median[patient_id]
+        cv = self._transport_cv[patient_id]
+        transport_time = median*math.exp(cv*eps[1])
+
+        hospital_id = self._patient_to_hospital[patient_id]
+        median = self._return_median[hospital_id, station_id]
+        cv = self._return_cv[hospital_id, station_id]
+        return_time = median*math.exp(cv*eps[2])
 
         # Create return Event
-        return_event_time = current_time + pretravel_delay + response_travel_time + transport_time + return_time + support_time
-        heapq.heappush(self._event_queue, Event(RETURN, return_event_time, station_id))
+        busy_time = (
+            pretravel_delay  # We count pretravel delay as busy time
+            + response_time
+            + transport_time
+            + return_time
+            + support_time
+        )
+        return_event_time = current_time + busy_time
+        heapq.heappush(
+            self._event_queue,
+            Event('return', return_event_time, station_id)
+        )
 
-        # Record response time, whether covered, and number of calls from this demand node
-        demand_node = self.patients.demand_node[patient_id]
-        # Don't include pretravel_delay when recording response time, but do include time waiting in FIFO queue (current_time - arrival_time)
-        response_time = response_travel_time + current_time - arrival_time
-        self._results[self._col2idx[f'response_time_{demand_node}']] += response_time
-        # Include pretravel_delay when evaluating coverage
-        response_time += pretravel_delay
-        self._results[self._col2idx[f'n_covered_{demand_node}']] += response_time < self.response_time_threshold
-        self._results[self._col2idx[f'n_arrivals_{demand_node}']] += 1
-    
-    def run(self, solution: list[int]) -> pd.DataFrame:
-        """Run multiple replications of the simulation using a given solution.
+        # Log response time (excluding pre-travel delay) and busy time
+        self._response_times[self._dispatch_idx] = response_time + current_time - arrival_time
+        self._total_busy_time += busy_time
 
-        Parameters
-        ----------
-        solution : list[int]
-            Number of ambulances located at each facility.
-        
-        Returns
-        -------
-        pd.DataFrame of shape (n_replications, 3*n_demand_nodes)
-            Contains the following columns for each demand node i:
-            - n_covered_<i>: Number of arrivals covered within the response time threshold
-            - response_time_<i>: Total response time (excluding pre-travel delay), summed over all arrivals
-            - n_arrivals_<i>: Total number of arrivals
-        """
-        results = [self.run_single_replication(solution) for _ in range(self.n_replications)]
-        results = pd.concat(results, ignore_index=True)
-        return results
+        self._dispatch_idx += 1

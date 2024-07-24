@@ -7,10 +7,10 @@ error = simulation$(Process).err
 
 should_transfer_files = YES
 when_to_transfer_output = ON_EXIT
-transfer_input_files = run_job.py, simulation.py, settings$(Process).csv, http://proxy.chtc.wisc.edu/SQUID/zzhou246/simulation.pkl, http://proxy.chtc.wisc.edu/SQUID/zzhou246/sim-env.tar.gz
+transfer_input_files = run_job.py, simulation.py, simulation.pkl, solutions$(Process).csv, http://proxy.chtc.wisc.edu/SQUID/zzhou246/sim-env.tar.gz
 
 request_cpus = 1
 request_memory = 8GB
 request_disk = 8GB
 
-queue 200
+queue 100

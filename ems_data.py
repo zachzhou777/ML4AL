@@ -1,364 +1,394 @@
 import os
-import glob
-import math
-import pickle
+from typing import Optional
 import numpy as np
 import pandas as pd
+import scipy
 from pyproj import Proj
-from tqdm import tqdm, trange
 
-# TODO: Not really sure if this is the best place for these constants
-# Toronto (region_id=1) data
+REGION_ID_TO_NAME = {
+    1: 'Toronto',
+    2: 'Durham',
+    3: 'Simcoe',
+    4: 'Muskoka & Parry Sound',
+    5: 'Peel',
+    6: 'Hamilton',
+    9: 'Halton',
+    14: 'York'
+}
+
+# Urban means at least 1000 people/mi^2 (386 people/km^2)
+URBAN_REGION_IDS = [1, 5, 6, 9, 14]
+RURAL_REGION_IDS = [2, 3, 4]
+
+# Number of OHCAs per year by region
+# Used in conjunction with OHCA prevalence to estimate arrival rate
+# Source: https://doi.org/10.1287/msom.2022.1092
+OHCAS_PER_YEAR = {
+    1: 2977,
+    2: 570,
+    3: 440,
+    4: 73,
+    5: 848,
+    6: 618,
+    9: 355,
+    14: 666
+}
+
+# Estimated proportion of calls requiring transport that are OHCAs
+# Denominator is Toronto transport volume in 2020
 # Source: https://www.toronto.ca/wp-content/uploads/2021/04/9765-Annual-Report-2020-web-final-compressed.pdf
-TORONTO_N_AMBULANCES = 234
-TORONTO_AVG_CALLS_PER_DAY = 194109/365
+OHCA_PREVALENCE = 2977 / 194109
 
 class EMSData:
-    """Class to read and preprocess EMS data for usage in simulation and MIP models.
+    """Class to read, preprocess, and store EMS data.
+
+    Instantiating this class will read and preprocess all data files,
+    then store the data internally. Because reading the data files is so
+    time-consuming, it is recommended to only instantiate this class
+    once, then pickle the object for future use.
+
+    To load data for a specific region, simply set the region_id
+    attribute. This will update the remaining attributes with the data
+    for that region.
 
     Parameters
     ----------
-    region_id : int
-        One of 1, 2, 3, 4, 5, 6, 9, or 14.
-    
-    x_intervals, y_intervals : int, optional
-        Number of grid intervals along the x- and y-axes. Grid is used to define demand nodes.
-    
     use_clinics : bool, optional
-        Whether patients can be transported to clinics in addition to hospitals.
-    
-    distance_correction_factor : float, optional
-        Factor to convert Euclidean distance to road distance.
-        Original paper: https://doi.org/10.1016/j.trpro.2014.10.066
+        Whether patients can be transported to clinics in addition to
+        hospitals.
     
     data_dir : str, optional
         Directory containing data files.
     
-    verbose : bool, optional
-        Whether to print progress bars.
-    
     Attributes
     ----------
     region_id : int
-        One of 1, 2, 3, 4, 5, 6, 9, or 14.
+        Region ID for which to load data into attributes.
+
+        1. Toronto
+        2. Durham
+        3. Simcoe
+        4. Muskoka
+        5. Peel
+        6. Hamilton
+        9. Halton
+        14. York
+
+        Setting region_id to one of the above values will update the
+        remaining attributes with data for that region.
     
-    x_intervals, y_intervals : int
-        Number of grid intervals along the x- and y-axes. Grid is used to define demand nodes.
+    urbanicity : {'urban', 'rural'}
+        Urbanicity.
+
+    patients : np.ndarray of shape (n_patients, 2)
+        Simulated patient locations in UTM coordinates.
     
-    data_dir : str
-        Directory containing data files.
+    stations : np.ndarray of shape (n_stations, 2)
+        Station locations in UTM coordinates.
     
-    urbanicity : str
-        Either 'Urban' or 'Rural'. Determined by region_id.
+    hospitals : np.ndarray of shape (n_hospitals, 2)
+        Hospital (and clinic) locations in UTM coordinates.
     
-    response_time_threshold : float
-        Response time threshold in minutes. Set to 9.0 for urban and 20.0 for rural.
+    nonemergent_factor : float
+        Ratio of non-emergent response time to emergent response time.
     
-    patients : pd.DataFrame
-        Historical patient location data. Includes the following columns:
-        - x: UTM easting coordinate;
-        - y: UTM northing coordinate;
-        - demand_node: Demand node ID;
-        - hospital: Nearest hospital ID.
+    arrival_times : np.ndarray of shape (n_arrival_times,)
+        Historical arrival times, given as the minute past midnight
+        (e.g., 60*8 + 30 for 8:30 AM).
     
-    demand_nodes : pd.DataFrame
-        Demand node locations. Includes the following columns:
-        - x: UTM easting coordinate;
-        - y: UTM northing coordinate;
-        - demand: Number of patients assigned to the demand node.
+    support_times : np.ndarray of shape (n_support_times,)
+        Historical support times in minutes.
+
+        Support time consists of scene time, transfer time, and turnover
+        time. Since these three times are likely correlated, we sum them
+        rather than keep them separate.
     
-    stations : pd.DataFrame
-        Station location data. Includes columns x and y for UTM coordinates.
-    
-    hospitals : pd.DataFrame
-        Hospital (and clinic) location data. Includes columns x and y for UTM coordinates.
-    
-    times : pd.DataFrame
-        Time data. Used to compute non-emergent scale, support times, and arrival times.
-    
-    nonemergent_scale : float
-        Ratio of non-emergent response time to emergent response time based on historical data.
-    
-    support_times : list[float]
-        Historical support (scene, transfer, and turnover) times in minutes.
-    
-    arrival_times : list[int]
-        Historical arrival times, given as the exact minute of the day (e.g., 60*8 + 30 for 8:30 AM).
-    
-    median_response_times : np.ndarray of shape (n_stations, n_patients)
-        median_response_times[i, j] is the median travel time in minutes from station i to patient j.
-    
-    median_transport_times : np.ndarray of shape (n_patients,)
-        median_transport_times[i] is the median travel time in minutes from patient i to their hospital.
-    
-    median_return_times : np.ndarray of shape (n_hospitals, n_stations)
-        median_return_times[i, j] is the median travel time in minutes from hospital i to station j.
-    
-    dispatch_order : np.ndarray of shape (n_patients, n_stations)
-        dispatch_order[i] is the station IDs sorted by increasing travel time to patient i.
-    
-    demand_node_to_station_times : np.ndarray of shape (n_stations, n_demand_nodes)
-        demand_node_to_station_times[i, j] is the median travel time in minutes from station j to demand node i. Used by MIP models.
+    avg_calls_per_day : float
+        Daily arrival rate of all EMS calls.
+
+        Estimated as the number of OHCAs per year divided by the
+        proportion of all calls requiring transport that are OHCAs.
     """
+    # Attributes to set when region_id is set
+    _REGION_ATTRS = [
+        'patients',
+        'stations',
+        'hospitals',
+        'avg_calls_per_day'
+    ]
+    _URBANICITY_ATTRS = [
+        'nonemergent_factor',
+        'arrival_times',
+        'support_times',
+    ]
+
     def __init__(
         self,
-        region_id: int,
-        x_intervals: int = 10,
-        y_intervals: int = 10,
         use_clinics: bool = False,
-        distance_correction_factor: float = 1.345,
-        data_dir: str = 'data',
-        verbose: bool = False
+        data_dir: str = 'data'
     ):
-        self.region_id = region_id
-        self.x_intervals = x_intervals
-        self.y_intervals = y_intervals
-        self.data_dir = data_dir
-        # TODO: Remaining regions
-        region2urbanicity = {
-            1: 'Urban',
-            4: 'Rural'
-        }
-        self.urbanicity = region2urbanicity[region_id]
-        urbanicity2rtt = {
-            'Urban': 9.0,
-            'Rural': 20.0
-        }
-        self.response_time_threshold = urbanicity2rtt[self.urbanicity]
-        self.patients = self._read_patient_location_data()
-        self.stations = self._read_station_data()
-        self.hospitals = self._read_hospital_data(use_clinics)
-        (self.demand_nodes,
-         self.patients['demand_node']) = self._define_demand_nodes()
-        self.patients['hospital'] = self._assign_patients_to_hospitals(verbose)
-        self.times = self._read_time_data()
-        self.nonemergent_scale = self._compute_nonemergent_scale()
-        self.support_times = self._compute_support_times()
-        self.arrival_times = self._compute_arrival_times()
-        (self.median_response_times,
-         self.median_transport_times,
-         self.median_return_times,
-         self.demand_node_to_station_times) = self._compute_median_travel_times(distance_correction_factor, verbose)
-        self.dispatch_order = self._determine_dispatch_order()
+        self._region_data = {}
+        self._urbanicity_data = {}
+        for region_id in REGION_ID_TO_NAME:
+            patients = self.read_patient_locations(region_id, data_dir)
+            stations = self.read_station_locations(region_id, data_dir)
+            hospitals = self.read_hospital_locations(
+                use_clinics, patients, data_dir
+            )
+            avg_calls_per_day = (OHCAS_PER_YEAR[region_id] / OHCA_PREVALENCE) / 365
+            self._region_data[region_id] = {
+                'patients': patients,
+                'stations': stations,
+                'hospitals': hospitals,
+                'avg_calls_per_day': avg_calls_per_day
+            }
+        for urbanicity in ['urban', 'rural']:
+            nemsis_data = self.read_nemsis_data(urbanicity, data_dir)
+            nonemergent_factor = self.compute_nonemergent_factor(nemsis_data)
+            arrival_times = self.compute_arrival_times(nemsis_data)
+            support_times = self.compute_support_times(nemsis_data)
+            self._urbanicity_data[urbanicity] = {
+                'nonemergent_factor': nonemergent_factor,
+                'arrival_times': arrival_times,
+                'support_times': support_times
+            }
     
-    def save_instance(self, filename: str):
-        """Dump EMSData instance to a pickle file."""
-        with open(filename, 'wb') as f:
-            pickle.dump(self, f)
+    @property
+    def region_id(self) -> int:
+        return self._region_id
     
-    @classmethod
-    def load_instance(cls, filename: str) -> 'EMSData':
-        """Load EMSData instance from a pickle file."""
-        with open(filename, 'rb') as f:
-            instance = pickle.load(f)
-        return instance
-    
-    def _read_patient_location_data(self) -> pd.DataFrame:
-        """Read patient location data files into a single DataFrame."""
-        patients = pd.DataFrame()
-        for filepath in glob.glob(os.path.join(self.data_dir, f'MRegion{self.region_id}KDE*.csv')):
-            patients = pd.concat([patients, pd.read_csv(filepath, header=None)], ignore_index=True)
-        patients.columns = ['y', 'x']
-        patients = patients[['x', 'y']]
-        return patients
-    
-    def _read_station_data(self) -> pd.DataFrame:
-        """Read station (a.k.a. base) data."""
-        stations = pd.read_csv(os.path.join(self.data_dir, 'Base_Locations.csv'))
-        # Type values: E = EMS, F = Fire, P = Police
-        stations = stations[(stations['Type'] == 'E') & (stations['Region'] == self.region_id)]
-        stations = stations[['Easting', 'Northing']]
-        stations.columns = ['x', 'y']
-        stations.reset_index(drop=True, inplace=True)
-        return stations
-    
-    def _read_hospital_data(self, use_clinics: bool) -> pd.DataFrame:
-        """Read hospital (and clinic) data."""
-        # All provider data
-        providers = pd.read_csv(os.path.join(self.data_dir, 'provider_data.csv'))
-        providers = providers[['X', 'Y', 'SERV_TYPE']]
-        
-        # Convert latitude (Y) and longitude (X) to UTM easting (x) and northing (y)
-        proj = Proj(proj='utm', zone=17, ellps='WGS84', datum='NAD83', units='m')
-        providers['x'], providers['y'] = proj(providers.X, providers.Y)
-        providers = providers.drop(columns=['X', 'Y'])
-        
-        # Drop providers too far from patients (1e4 means 10 km)
-        x_min, x_max = self.patients.x.min() - 1e4, self.patients.x.max() + 1e4
-        y_min, y_max = self.patients.y.min() - 1e4, self.patients.y.max() + 1e4
-        providers = providers[
-            (x_min <= providers.x) & (providers.x <= x_max)
-            & (y_min <= providers.y) & (providers.y <= y_max)
-        ]
+    @region_id.setter
+    def region_id(self, region_id: int):
+        if region_id not in REGION_ID_TO_NAME:
+            raise ValueError("Invalid region_id")
+        self._region_id = region_id
+        if region_id in RURAL_REGION_IDS:
+            self.urbanicity = 'rural'
+        else:
+            self.urbanicity = 'urban'
+        for attr in EMSData._REGION_ATTRS:
+            setattr(self, attr, self._region_data[region_id][attr])
+        for attr in EMSData._URBANICITY_ATTRS:
+            setattr(self, attr, self._urbanicity_data[self.urbanicity][attr])
 
-        # Keep only hospitals (and clinics)
-        serv_types = ['Hospital - Corporation', 'Hospital - Site']
-        if use_clinics:
-            serv_types += ['Community Health Centre', 'Independent Health Facility']
-        hospitals = providers[providers.SERV_TYPE.isin(serv_types)]
-        hospitals = hospitals[['x', 'y']]
-        hospitals.reset_index(drop=True, inplace=True)
-
-        return hospitals
-    
-    def _define_demand_nodes(self) -> tuple[pd.DataFrame, pd.Series]:
-        """Using historical patient location data, define demand nodes.
-
-        Historical demand is broken up into regions by an
-        x_intervals-by-y_intervals grid. For each region where there is
-        demand, the centroid of the demand points within the region is
-        used as the location of a demand node. Patients are assigned to
-        demand nodes based on grid region.
-        """
-        x = self.patients.x
-        y = self.patients.y
-
-        # Use np.nextafter because we use strict inequalities later (see in_region)
-        x_min, x_max = x.min(), np.nextafter(x.max(), x.max()+1)
-        y_min, y_max = y.min(), np.nextafter(y.max(), y.max()+1)
-        x_gridlines = np.linspace(x_min, x_max, self.x_intervals+1)
-        y_gridlines = np.linspace(y_min, y_max, self.y_intervals+1)
-
-        centroids = []
-        demand = []
-        patient2node = pd.Series(0, index=self.patients.index)
-        demand_node_id = 0
-        for i in range(self.x_intervals):
-            for j in range(self.y_intervals):
-                in_region = ((x_gridlines[i] <= x) & (x < x_gridlines[i + 1])
-                             & (y_gridlines[j] <= y) & (y < y_gridlines[j + 1]))
-                if in_region.any():
-                    centroids.append(self.patients[in_region][['x', 'y']].mean())
-                    demand.append(in_region.sum())
-                    patient2node[in_region] = demand_node_id
-                    demand_node_id += 1
-        demand_nodes = pd.DataFrame(centroids)
-        demand_nodes['demand'] = demand
-
-        return demand_nodes, patient2node
-
-    def _assign_patients_to_hospitals(self, verbose: bool) -> pd.Series:
-        """For simulation, we assume patients are always transported to their nearest hospital."""
-        patients = self.patients[['x', 'y']].values
-        hospitals = self.hospitals[['x', 'y']].values
-        euc_dist = lambda p, q: np.linalg.norm(p - q)
-        nearest_hospital = lambda i: np.argmin([euc_dist(patients[i], hospitals[j]) for j in range(hospitals.shape[0])])
-        patient2hospital = pd.Series([nearest_hospital(i) for i in trange(patients.shape[0], desc="Assigning patients to hospitals", disable=not verbose)])
-        return patient2hospital
-    
-    def _read_time_data(self) -> pd.DataFrame:
-        """Read Times_<urbanicity>data.csv.
-
-        Keep only the columns needed to compute non-emergent scale, support times, and arrival times.
-        """
-        time_data = pd.read_csv(os.path.join(self.data_dir,  f'Times_{self.urbanicity}data.csv'))
-        time_data = time_data[[
-            'Response_Time', 'OG', 'eResponse_23-[ResponseModetoScene]',  # Non-emergent scale
-            'Scene_Time', 'Transfer_Time', 'Turnover_Time',  # Support times
-            'eTimes_01-[PSAPCallDate/Time]'  # Arrival times
-        ]]
-        return time_data
-    
-    def _compute_nonemergent_scale(self) -> float:
-        """Compute ratio of non-emergent response time to emergent response time based on historical data."""
-        data = self.times
-        data = data.dropna(subset='Response_Time')
-        data = data[data.OG == 0]  # TODO ask Eric what OG means
-        emergent_times = data.loc[data['eResponse_23-[ResponseModetoScene]'] == 'Emergent (Immediate Response)', 'Response_Time']
-        nonemergent_times = data.loc[data['eResponse_23-[ResponseModetoScene]'] == 'Non-Emergent', 'Response_Time']
-        nonemergent_scale = nonemergent_times.mean() / emergent_times.mean()
-        return nonemergent_scale
-    
-    def _compute_support_times(self) -> list[float]:
-        """Compute support times."""
-        data = self.times[['Scene_Time', 'Transfer_Time', 'Turnover_Time']]
-        data = data.dropna()
-        data = data[(data > 0.0).all(axis=1)]  # Drop rows with zeros
-        # Keep all three times together since they're likely correlated
-        support_times = data.sum(axis=1).tolist()
-        return support_times
-    
-    def _compute_arrival_times(self) -> list[int]:
-        """Compute exact minute of the day of historical arrivals.
-        
-        TODO: Another idea, estimate Poisson parameter for each of the 24 hours of the day, sample Poisson/exponential instead
-        """
-        arrival_times = self.times['eTimes_01-[PSAPCallDate/Time]']
-        arrival_times = arrival_times.dropna()
-        arrival_times = pd.to_datetime(arrival_times, format='%Y-%m-%d %H:%M:%S')
-        arrival_times = 60*arrival_times.dt.hour + arrival_times.dt.minute
-        arrival_times = arrival_times.tolist()
-        return arrival_times
-    
     @staticmethod
-    def median_travel_time(d: float, a: float = 41.0, v_c: float = 100.7) -> float:
-        """Compute median travel time.
-
-        Original paper: https://doi.org/10.1287/mnsc.1090.1142
+    def read_patient_locations(
+        region_id: int,
+        data_dir: str = 'data',
+        test_id: Optional[int] = None
+    ) -> np.ndarray:
+        """Read simulated patient locations for a region.
 
         Parameters
         ----------
-        d : float
-            Distance in km.
+        region_id : int
+            Region ID.
         
-        a : float, optional
-            Acceleration in km/hr/min.
+        data_dir : str, optional
+            Directory containing data files.
         
-        v_c : float, optional
-            Cruising speed in km/hr.
+        test_id : int, optional
+            Test ID of the file to read. If None, read all files for the
+            region.
+        
+        Returns
+        -------
+        np.ndarray of shape (n_patients, 2)
+            Patients' UTM coordinates (easting, northing).
+        """
+        patients = []
+        test_ids = range(100) if test_id is None else [test_id]
+        for test_id in test_ids:
+            filename = os.path.join(data_dir, f'MRegion{region_id}KDEtest{test_id}.csv')
+            patients.append(np.loadtxt(filename, delimiter=','))
+        patients = np.vstack(patients)
+        patients = patients[:, [1, 0]]  # CSV files have (northing, easting) format
+        return patients
 
+    @staticmethod
+    def read_station_locations(
+        region_id: int,
+        data_dir: str = 'data'
+    ) -> np.ndarray:
+        """Read station locations for a region.
+
+        Parameters
+        ----------
+        region_id : int
+            Region ID.
+        
+        data_dir : str, optional
+            Directory containing data files.
+        
+        Returns
+        -------
+        np.ndarray of shape (n_stations, 2)
+            Stations' UTM coordinates (easting, northing).
+        """
+        stations = pd.read_csv(os.path.join(data_dir, 'Base_Locations.csv'))
+        stations = stations.loc[
+            # Type values: E = EMS, F = Fire, P = Police
+            # To simplify the problem, we only consider EMS stations
+            (stations['Type'] == 'E')
+            & (stations['Region'] == region_id),
+            ['Easting', 'Northing']
+        ]
+        return stations.to_numpy()
+    
+    @staticmethod
+    def read_hospital_locations(
+        use_clinics: bool = False,
+        patients: Optional[np.ndarray] = None,
+        data_dir: str = 'data'
+    ) -> np.ndarray:
+        """Read hospital (and optionally clinic) locations.
+
+        Optionally keep only the hospitals that are the closest one to
+        any patient.
+
+        Parameters
+        ----------
+        use_clinics : bool, optional
+            Whether to consider clinics as hospitals.
+        
+        patients : pd.DataFrame of shape (n_patients, 2), optional
+            Simulated patient locations in UTM coordinates.
+        
+        data_dir : str, optional
+            Directory containing data files.
+        
+        Returns
+        -------
+        np.ndarray of shape (n_hospitals, 2)
+            Hospitals' UTM coordinates (easting, northing).
+        """
+        # Read all provider data, keep only hospitals (and clinics)
+        providers = pd.read_csv(os.path.join(data_dir, 'provider_data.csv'))
+        serv_types = ['Hospital - Corporation', 'Hospital - Site']
+        if use_clinics:
+            serv_types += ['Community Health Centre', 'Independent Health Facility']
+        hospitals = providers.loc[providers.SERV_TYPE.isin(serv_types), ['X', 'Y']]
+        
+        # Convert latitude (Y) and longitude (X) to UTM coordinates
+        proj = Proj(proj='utm', zone=17, ellps='WGS84', datum='NAD83', units='m')
+        hospitals = np.column_stack(proj(hospitals.X, hospitals.Y))
+        
+        # Optionally keep only the hospitals that are the closest one to any patient
+        if patients is not None:
+            transport_distances = scipy.spatial.distance.cdist(patients, hospitals)
+            closest_hospitals_ids = np.unique(transport_distances.argmin(axis=1))
+            hospitals = hospitals[closest_hospitals_ids]
+
+        return hospitals
+    
+    @staticmethod
+    def read_nemsis_data(
+        urbanicity: str,
+        keep_all_columns: bool = False,
+        data_dir: str = 'data'
+    ) -> pd.DataFrame:
+        """Read NEMSIS data for a region.
+
+        Optionally, keep only the columns needed to compute non-emergent
+        factor, arrival times, and support times.
+
+        Parameters
+        ----------
+        urbanicity : {'urban', 'rural'}
+            Urbanicity of the region.
+        
+        keep_all_columns : bool, optional
+            Whether to keep all columns in the data file.
+        
+        data_dir : str, optional
+            Directory containing data files.
+        
+        Returns
+        -------
+        pd.DataFrame
+            NEMSIS data.
+        """
+        nemsis_data = pd.read_csv(os.path.join(data_dir,  f'nemsis_{urbanicity}.csv'))
+        if not keep_all_columns:
+            nemsis_data = nemsis_data[[
+                # Non-emergent factor
+                'Response_Time',
+                'OG',
+                'eResponse_23-[ResponseModetoScene]',
+                # Arrival times
+                'eTimes_01-[PSAPCallDate/Time]',
+                # Support times
+                'Scene_Time',
+                'Transfer_Time',
+                'Turnover_Time'
+            ]]
+        return nemsis_data
+    
+    @staticmethod
+    def compute_nonemergent_factor(nemsis_data: pd.DataFrame) -> float:
+        """Compute ratio of non-emergent response time to emergent
+        response time.
+
+        Parameters
+        ----------
+        nemsis_data : pd.DataFrame
+            NEMSIS data.
+        
         Returns
         -------
         float
-            Median travel time in minutes.
+            Ratio of non-emergent response time to emergent response
+            time.
         """
-        a *= 60  # Convert to km/hr/hr
-        d_c = v_c**2 / (2*a)
-        median = 2*math.sqrt(d/a) if d <= 2*d_c else v_c/a + d/v_c
-        median *= 60  # Convert to minutes
-        return median
-
-    def _compute_median_travel_times(self, distance_correction_factor: float, verbose: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """For every relevant pair of locations, compute median travel time."""
-        patients = self.patients[['x', 'y']].values
-        patient2hospital = self.patients.hospital.values
-        stations = self.stations[['x', 'y']].values
-        hospitals = self.hospitals[['x', 'y']].values
-        demand_nodes = self.demand_nodes[['x', 'y']].values
-        n_patients = patients.shape[0]
-        n_stations = stations.shape[0]
-        n_hospitals = hospitals.shape[0]
-        n_demand_nodes = demand_nodes.shape[0]
-
-        # Divide by 1000 to convert to km (UTM coordinates are in meters)
-        dist = lambda p, q: distance_correction_factor*np.linalg.norm(p - q)/1000
-        median_travel_time = lambda p, q: EMSData.median_travel_time(dist(p, q))
-
-        median_response_times = np.empty((n_stations, n_patients))
-        median_transport_times = np.empty(n_patients)
-        median_return_times = np.empty((n_hospitals, n_stations))
-        demand_node_to_station_times = np.empty((n_demand_nodes, n_stations))
-        n_iter = n_stations*n_patients + n_patients + n_hospitals*n_stations + n_demand_nodes*n_stations
-        with tqdm(total=n_iter, desc="Computing (median) travel times", disable=not verbose) as pbar:
-            for i in range(n_stations):
-                for j in range(n_patients):
-                    median_response_times[i, j] = median_travel_time(stations[i], patients[j])
-                    pbar.update()
-            for i in range(n_patients):
-                median_transport_times[i] = median_travel_time(patients[i], hospitals[patient2hospital[i]])
-                pbar.update()
-            for i in range(n_hospitals):
-                for j in range(n_stations):
-                    median_return_times[i, j] = self.nonemergent_scale * median_travel_time(hospitals[i], stations[j])
-                    pbar.update()
-            for i in range(n_demand_nodes):
-                for j in range(n_stations):
-                    demand_node_to_station_times[i, j] = median_travel_time(demand_nodes[i], stations[j])
-                    pbar.update()
-        
-        return median_response_times, median_transport_times, median_return_times, demand_node_to_station_times
+        data = nemsis_data.dropna(subset='Response_Time')
+        data = data[data.OG == 0]  # TODO ask Eric what OG means
+        emergent_times = data.loc[
+            data['eResponse_23-[ResponseModetoScene]']
+            == 'Emergent (Immediate Response)', 'Response_Time'
+        ]
+        nonemergent_times = data.loc[
+            data['eResponse_23-[ResponseModetoScene]']
+            == 'Non-Emergent', 'Response_Time'
+        ]
+        nonemergent_factor = nonemergent_times.mean() / emergent_times.mean()
+        return nonemergent_factor
     
-    def _determine_dispatch_order(self) -> np.ndarray:
-        """For each patient, order stations based on proximity."""
-        dispatch_order = np.argsort(self.median_response_times.T)
-        return dispatch_order
+    @staticmethod
+    def compute_arrival_times(nemsis_data: pd.DataFrame) -> np.ndarray:
+        """Compute exact minute of the day of historical arrivals.
+        
+        Parameters
+        ----------
+        nemsis_data : pd.DataFrame
+            NEMSIS data.
+        
+        Returns
+        -------
+        np.ndarray of shape (n_arrival_times,)
+            Historical arrival times in minutes past midnight.
+        """
+        arrival_times = nemsis_data['eTimes_01-[PSAPCallDate/Time]']
+        arrival_times = arrival_times.dropna()
+        arrival_times = pd.to_datetime(arrival_times, format='%Y-%m-%d %H:%M:%S')
+        arrival_times = 60*arrival_times.dt.hour + arrival_times.dt.minute
+        return arrival_times.to_numpy()
+    
+    @staticmethod
+    def compute_support_times(nemsis_data: pd.DataFrame) -> np.ndarray:
+        """Compute historical support times in minutes.
+        
+        Parameters
+        ----------
+        nemsis_data : pd.DataFrame
+            NEMSIS data.
+        
+        Returns
+        -------
+        np.ndarray of shape (n_support_times,)
+            Historical support times in minutes.
+        """
+        data = nemsis_data[['Scene_Time', 'Transfer_Time', 'Turnover_Time']]
+        data = data.dropna()
+        data = data[(data > 0.0).all(axis=1)]  # Drop rows with zeros
+        support_times = data.sum(axis=1).to_numpy()
+        return support_times
