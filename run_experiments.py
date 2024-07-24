@@ -17,7 +17,7 @@ TOTAL_AMBULANCE_COUNTS = {
     5: [20, 25, 30]
 }
 FACILITY_CAPACITY = 5
-TIME_LIMIT = 6  # TODO SWITCH BACK
+TIME_LIMIT = 600
 SUCCESS_PROB = 0.9
 # Estimated using best solution from dataset w.r.t coverage_9min for Toronto and Peel, coverage_15min for Simcoe
 BUSY_FRACTION = {
