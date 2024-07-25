@@ -316,7 +316,7 @@ def mlp_based_model(
         add_sequential_constr(model, sequential_model, x, z)
         pass
     else:
-        M_minus, M_plus = calculate_bounds(weights[:-1], biases[:-1], n_ambulances)
+        M_minus, M_plus = compute_bounds(weights[:-1], biases[:-1], n_ambulances)
         embed_mlp(model, weights[:-1], biases[:-1], x, z, M_minus, M_plus, scale_relu)
     model.addConstr(x.sum() <= n_ambulances)
     model.optimize()
@@ -411,7 +411,7 @@ def embed_mlp(
         gurobi_model.addConstr(a[ell][inactive_units] == 0)
         gurobi_model.addConstr(h[ell][inactive_units] == 0)
 
-def calculate_bounds(
+def compute_bounds(
     weights: list[np.ndarray],
     biases: list[np.ndarray],
     n_ambulances: int,
@@ -446,13 +446,13 @@ def calculate_bounds(
     M_minus = []
     M_plus = []
 
-    first_iter = True
+    first_layer = True
     for weight, bias in zip(weights[:-1], biases[:-1]):
         # For the first hidden layer, leverage the following assumptions on the input x:
         # - x is nonnegative
         # - x sums to n_ambulances
         # - Each component of x is at most facility_capacity
-        if first_iter:
+        if first_layer:
             n_stations = weight.shape[1]
             # If n_ambulances = 7, facility_capacity = 3, n_stations = 5, then x = [3, 3, 1, 0, 0]
             x = np.zeros(n_stations)
@@ -461,10 +461,10 @@ def calculate_bounds(
             if n_stations_full < n_stations:
                 x[n_stations_full] = n_ambulances % facility_capacity
             weight_sorted = np.sort(weight, axis=1)
-            M_minus_ell = weight_sorted@x + bias
+            M_minus_ell = np.minimum(weight_sorted, 0)@x + bias
             weight_sorted = np.fliplr(weight_sorted)
-            M_plus_ell = weight_sorted@x + bias
-            first_iter = False
+            M_plus_ell = np.maximum(weight_sorted, 0)@x + bias
+            first_layer = False
         
         # For subsequent hidden layers, assume units can independently achieve zero or maximum activation
         else:
