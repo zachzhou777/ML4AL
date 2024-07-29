@@ -22,7 +22,7 @@ def mexclp(
     facility_capacity: Optional[int] = None,
     time_limit: Optional[float] = None,
     verbose: bool = False
-) -> tuple[np.ndarray, float]:
+) -> np.ndarray:
     """Solve the MEXCLP model (Daskin, 1983).
 
     Parameters
@@ -232,16 +232,7 @@ def mlp_based_model(
     time_limit: Optional[float] = None,
     verbose: bool = False
 ) -> np.ndarray:
-    """Solve the MLP-based model.
-
-    If solving a minimization problem, the final hidden layer's
-    activation function is assumed to be ReLU. If solving a maximization
-    problem, the final hidden layer's activation function is assumed to
-    be the modified sigmoid function (sigmoid(z) for z > 0, 0.25*z + 0.5
-    otherwise). Assume the final layer's weights are positive in order
-    to exploit convexity/concavity of the final hidden layer's
-    activation function and avoid introducing a binary variable for each
-    unit in this layer.
+    """Solve the MLP-based ambulance location model.
 
     Parameters
     ----------
@@ -258,16 +249,15 @@ def mlp_based_model(
         Maximum number of ambulances allowed at any facility.
     
     use_gurobi_ml : bool, optional
-        Use the Gurobi Machine Learning package to embed everything up
-        to the last hidden layer (not including the last hidden layer's
-        activation function).
+        Use the Gurobi Machine Learning package to embed the MLP.
     
     scale_relu : bool, optional
-        How to model the ReLU activation function for hidden layers.
-        Ignored if use_gurobi_ml is True.
-        - If False, use the original approach seen in other papers.
+        How to model the ReLU activation function.
+        - If False, use the original approach seen in most papers.
         - If True, scale the net inputs to ReLU units so that they are
         in [-1, 1], then rescale the outputs.
+
+        Ignored if use_gurobi_ml is True.
     
     time_limit : float, optional
         Time limit in seconds.
@@ -283,29 +273,17 @@ def mlp_based_model(
     if facility_capacity is None:
         facility_capacity = n_ambulances
     n_facilities = weights[0].shape[1]
-    final_hidden_size = weights[-1].shape[1]
 
     model = gp.Model()
     model.Params.LogToConsole = verbose
     if time_limit is not None:
         model.Params.TimeLimit = time_limit
     x = model.addMVar(n_facilities, lb=0, ub=facility_capacity, vtype=GRB.INTEGER)
-    z = model.addMVar(final_hidden_size, lb=-GRB.INFINITY, ub=GRB.INFINITY, vtype=GRB.CONTINUOUS)
-    y = model.addMVar(final_hidden_size, lb=-GRB.INFINITY, ub=GRB.INFINITY, vtype=GRB.CONTINUOUS)
-    # Objective function and constraints to embed the last hidden layer's activation function and the last linear layer
-    if optimization_sense == GRB.MAXIMIZE:
-        embed_modified_sigmoid(model, z, y)
-    elif optimization_sense == GRB.MINIMIZE:
-        # Embed last ReLU layer
-        model.addConstr(y >= 0)
-        model.addConstr(y >= z)
-    else:
-        raise ValueError("optimization_sense must be GRB.MINIMIZE or GRB.MAXIMIZE")
-    model.setObjective(weights[-1][0]@y + biases[-1][0], optimization_sense)
-    # Embed MLP up to the last hidden layer's activation function
+    y = model.addVar(lb=-GRB.INFINITY, ub=GRB.INFINITY, vtype=GRB.CONTINUOUS)
+    model.setObjective(y, optimization_sense)
     if use_gurobi_ml:
         sequential_layers = []
-        for weight, bias in zip(weights[:-1], biases[:-1]):
+        for weight, bias in zip(weights, biases):
             linear = nn.Linear(weight.shape[1], weight.shape[0])
             with torch.no_grad():
                 linear.weight.copy_(torch.tensor(weight))
@@ -313,11 +291,10 @@ def mlp_based_model(
             sequential_layers.extend([linear, nn.ReLU()])
         sequential_layers.pop()  # Remove last ReLU
         sequential_model = nn.Sequential(*sequential_layers)
-        add_sequential_constr(model, sequential_model, x, z)
-        pass
+        add_sequential_constr(model, sequential_model, x, y)
     else:
-        M_minus, M_plus = compute_bounds(weights[:-1], biases[:-1], n_ambulances)
-        embed_mlp(model, weights[:-1], biases[:-1], x, z, M_minus, M_plus, scale_relu)
+        M_minus, M_plus = compute_bounds(weights, biases, n_ambulances)
+        embed_mlp(model, weights, biases, x, y, M_minus, M_plus, scale_relu)
     model.addConstr(x.sum() <= n_ambulances)
     model.optimize()
     
@@ -336,12 +313,7 @@ def embed_mlp(
     """Embed an MLP in a Gurobi model.
 
     Assumes the MLP uses the ReLU activation function for hidden layers,
-    and no activation function for the output layer. For our use case,
-    we use this function to embed everything up to the final hidden
-    layer (not including the final hidden layer's activation function).
-    Thus, when we call this function, `weights` and `biases` exclude the
-    last linear layer, and `output_vars` corresponds to the final hidden
-    layer's pre-activation values.
+    and no activation function for the output layer.
 
     Parameters
     ----------
@@ -476,41 +448,3 @@ def compute_bounds(
         M_plus.append(M_plus_ell)
     
     return M_minus, M_plus
-
-def embed_modified_sigmoid(
-    gurobi_model: gp.Model,
-    input_vars: gp.MVar,
-    output_vars: gp.MVar,
-    tangent_points: Optional[np.ndarray] = None
-):
-    """Embed the modified sigmoid function applied at the last hidden
-    layer in a Gurobi model.
-    
-    We model the function as a piecewise linear function. In general,
-    modeling piecewise linear functions requires introducing additional
-    binary variables, but because the function is concave and the MIP
-    has to maximize it, it is sufficient to use only linear constraints.
-    
-    Parameters
-    ----------
-    gurobi_model : gp.Model
-        Gurobi model.
-    
-    input_vars : gp.MVar
-        Decision variables used as input to the function.
-    
-    output_vars : gp.MVar
-        Decision variables used as output from the function.
-    
-    tangent_points : np.ndarray, optional
-        Points where tangent lines are used to approximate the function.
-    """
-    gurobi_model.addConstr(output_vars <= 1)
-    if tangent_points is None:
-        tangent_points = np.linspace(0, 5, 11)
-    s = lambda z: 1/(1 + np.exp(-z))
-    ds = lambda z: s(z)*(1 - s(z))
-    gurobi_model.addConstrs((
-        output_vars <= ds(z)*input_vars + s(z) - ds(z)*z
-        for z in tangent_points
-    ))

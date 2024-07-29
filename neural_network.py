@@ -7,48 +7,10 @@ from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import train_test_split
 from tqdm import trange
 
-class PositiveLinear(nn.Module):
-    """A linear layer where the weights are positive.
-
-    Source: https://discuss.pytorch.org/t/positive-weights/19701/7
-    """
-    def __init__(self, in_features: int, out_features: int):
-        super(PositiveLinear, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.log_weight = nn.Parameter(torch.empty(self.out_features, self.in_features))
-        self.bias = nn.Parameter(torch.empty(self.out_features))
-        self.reset_parameters()
-    
-    def reset_parameters(self):
-        nn.init.xavier_uniform_(self.log_weight)
-        nn.init.zeros_(self.bias)
-    
-    def forward(self, input):
-        return F.linear(input, self.log_weight.exp(), self.bias)
-
-class ModifiedSigmoid(nn.Module):
-    """A function that returns sigmoid(z) for z > 0, 0.25 * z + 0.5
-    otherwise.
-
-    The MIP formulation implements a piecewise linear approximation of
-    this function.
-    """
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return torch.where(z > 0, torch.sigmoid(z), 0.25 * z + 0.5)
-
 class MLP(nn.Sequential):
-    """Multilayer perceptron for predicting an ambulance location
-    performance metric.
+    """Multilayer perceptron for single-output regression.
 
-    The model takes an allocation of ambulances to facilities as input,
-    and produces a single metric.
-
-    All hidden layers except the last use the ReLU activation function.
-    If the MLP predicts coverage, then the final hidden layer uses the
-    ModifiedSigmoid activation function. Otherwise if the MLP predicts
-    average response time, then the final hidden layer uses the ReLU
-    activation function.
+    Hidden units apply the ReLU activation function.
 
     Parameters
     ----------
@@ -57,12 +19,6 @@ class MLP(nn.Sequential):
     
     hidden_dims : list[int]
         Sizes of hidden layers.
-    
-    final_hidden_activation : nn.Module, optional
-        Activation function for the final hidden layer. Defaults to ReLU.
-    
-    positive_final_weights : bool, optional
-        Whether to use positive weights for the final linear layer.
     
     dropout : float, optional
         Dropout probability.
@@ -157,9 +113,7 @@ class MLP(nn.Sequential):
         self,
         in_dim: int,
         hidden_dims: list[int],
-        final_hidden_activation: Optional[nn.Module] = None,
-        positive_final_weights: bool = True,
-        dropout: float = 0.3,
+        dropout: float = 0.5,
         loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = F.mse_loss,
         optimizer: type[torch.optim.Optimizer] = torch.optim.Adam,
         optimizer_params: Optional[dict[str, Any]] = None,
@@ -167,26 +121,23 @@ class MLP(nn.Sequential):
         lr_scheduler_params: Optional[dict[str, Any]] = None,
         batch_size: int = 128,
         max_epochs: int = 100,
-        validation_fraction: float = 0.2,
+        validation_fraction: float = 0.1,
         rel_tol: float = 1e-4,
         abs_tol: float = 0.0,
         patience: int = 20,
         name: str = 'model',
         verbose: bool = True
     ):
-        if final_hidden_activation is None:
-            final_hidden_activation = nn.ReLU()
         layers = []
-        for i, hidden_dim in enumerate(hidden_dims):
-            layers.append(nn.Linear(in_dim, hidden_dim))
-            layers.append(nn.ReLU() if i < len(hidden_dims) - 1 else final_hidden_activation)
-            layers.append(nn.Dropout(dropout))
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(in_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            ])
             in_dim = hidden_dim
-        last_linear_layer = (
-            PositiveLinear(hidden_dims[-1], 1) if positive_final_weights
-            else nn.Linear(hidden_dims[-1], 1)
-        )
-        layers.append(last_linear_layer)
+        final_layer = nn.Linear(hidden_dims[-1], 1)
+        layers.append(final_layer)
         super().__init__(*layers)
 
         # Set attributes
@@ -214,15 +165,11 @@ class MLP(nn.Sequential):
     
     def save_npz(self):
         """Save model parameters to .npz file."""
-        # Doesn't include PositiveLinear if that's the last layer
         linear_layers = [layer for layer in self if isinstance(layer, nn.Linear)]
         weights_and_biases = {}
         for i, layer in enumerate(linear_layers):
             weights_and_biases[f'weight_{i}'] = layer.weight.detach().cpu().numpy()
             weights_and_biases[f'bias_{i}'] = layer.bias.detach().cpu().numpy()
-        if isinstance(self[-1], PositiveLinear):
-            weights_and_biases[f'weight_{len(linear_layers)}'] = self[-1].log_weight.exp().detach().cpu().numpy()
-            weights_and_biases[f'bias_{len(linear_layers)}'] = self[-1].bias.detach().cpu().numpy()
         np.savez(f'{self.name}.npz', **weights_and_biases)
     
     @staticmethod

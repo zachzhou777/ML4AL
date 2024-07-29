@@ -17,9 +17,9 @@ TOTAL_AMBULANCE_COUNTS = {
     3: [14, 17, 20],
     5: [20, 25, 30]
 }
-FACILITY_CAPACITY = 5
+FACILITY_CAPACITY = 4
 TIME_LIMIT = 600
-SUCCESS_PROB = 0.9
+SUCCESS_PROB = 0.8
 # Estimated using best solution from dataset w.r.t coverage_9min for Toronto and Peel, coverage_15min for Simcoe
 BUSY_FRACTION = {
     1: {43: 0.5378511773938689, 50: 0.4369429489820591, 57: 0.3874100103626275},
@@ -35,8 +35,8 @@ SERVICE_RATE = {
 
 def best_solution_from_dataset(dataset: pd.DataFrame, n_ambulances: int, metric: str) -> tuple[pd.Series, pd.Series]:
     """Finds the best solution w.r.t. a metric for a given maximum number of ambulances."""
-    Y = dataset[METRICS]
     X = dataset.drop(columns=METRICS)
+    Y = dataset[METRICS]
     indices = np.where(X.sum(axis=1) <= n_ambulances)[0]
     argmin_or_argmax = np.argmin if 'response_time' in metric else np.argmax
     y = Y[metric]
