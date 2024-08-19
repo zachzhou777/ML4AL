@@ -5,9 +5,11 @@ import pandas as pd
 from scipy import optimize
 import torch
 import torch.nn as nn
+from sklearn.tree import DecisionTreeRegressor
 import gurobipy as gp
 from gurobipy import GRB
 from gurobi_ml.torch import add_sequential_constr
+from gurobi_ml.sklearn import add_decision_tree_regressor_constr
 
 # Precomputed distances (km) such that response time at most 9 or 15 minutes with probability 90%
 MEXCLP_THRESHOLD_9MIN = 3.64
@@ -22,8 +24,8 @@ def mexclp(
     facility_capacity: Optional[int] = None,
     time_limit: Optional[float] = None,
     verbose: bool = False
-) -> np.ndarray:
-    """Solve the MEXCLP model (Daskin, 1983).
+) -> tuple[np.ndarray, gp.Model]:
+    """Solve the MEXCLP model.
 
     Parameters
     ----------
@@ -55,8 +57,11 @@ def mexclp(
     
     Returns
     -------
-    np.ndarray of shape (n_facilities,)
+    solution : np.ndarray of shape (n_facilities,)
         Number of ambulances located at each facility.
+    
+    model : gp.Model
+        Gurobi model.
     """
     if facility_capacity is None:
         facility_capacity = n_ambulances
@@ -86,9 +91,9 @@ def mexclp(
     model.addConstr(x.sum() <= n_ambulances)
     model.optimize()
 
-    return np.array([int(x[j].X + 0.5) for j in range(n_facilities)])
+    return np.array([int(x[j].X + 0.5) for j in range(n_facilities)]), model
 
-def pmedian_with_queuing(
+def pmedian_with_queueing(
     n_ambulances: int,
     distance: np.ndarray,
     arrival_rate: float,
@@ -98,10 +103,9 @@ def pmedian_with_queuing(
     facility_capacity: Optional[int] = None,
     time_limit: Optional[float] = None,
     verbose: bool = False
-) -> np.ndarray | None:
-    """Solve a model that combines the p-median model with queuing
-    constraints. Based on Marianov and Serra (2002) and Boutilier and
-    Chan (2022).
+) -> tuple[np.ndarray | None, gp.Model]:
+    """Solve a model that combines the p-median model with queueing
+    constraints.
 
     Note that the model may be infeasible if the arrival rate is too
     high relative to the service rate, in which case this function will
@@ -141,9 +145,12 @@ def pmedian_with_queuing(
     
     Returns
     -------
-    np.ndarray of shape (n_facilities,) | None
+    solution : np.ndarray of shape (n_facilities,) | None
         Number of ambulances located at each facility. If the model is
         infeasible, return None.
+    
+    model : gp.Model
+        Gurobi model.
     """
     if facility_capacity is None:
         facility_capacity = n_ambulances
@@ -183,7 +190,7 @@ def pmedian_with_queuing(
     
     x = np.array([[x[j, k].X for k in range(facility_capacity)] for j in range(n_facilities)])
     solution = np.rint(x.sum(axis=1)).astype(int)
-    return solution
+    return solution, model
 
 def compute_rho(max_servers: int, success_prob: float) -> list[float]:
     """Compute rho values needed by queuing constraints.
@@ -221,6 +228,131 @@ def compute_rho(max_servers: int, success_prob: float) -> list[float]:
     
     return rho
 
+def linear_based_model(
+    n_ambulances: int,
+    optimization_sense: int,
+    coef: np.ndarray,
+    intercept: float,
+    facility_capacity: int,
+    time_limit: Optional[float] = None,
+    verbose: bool = False
+) -> tuple[np.ndarray, gp.Model]:
+    """Solve an ML-based ambulance location model which embeds a linear model.
+
+    Parameters
+    ----------
+    n_ambulances : int
+        Total number of ambulances.
+    
+    optimization_sense : {GRB.MINIMIZE, GRB.MAXIMIZE}
+        Whether to solve a minimization or maximization problem.
+    
+    coef : np.ndarray of shape (n_facilities*facility_capacity,)
+        Coefficients of the linear model.
+    
+    intercept : float
+        Intercept of the linear model.
+    
+    facility_capacity : int
+        Maximum number of ambulances allowed at any facility.
+    
+    time_limit : float, optional
+        Time limit in seconds.
+    
+    verbose : bool, optional
+        Print Gurobi output.
+    
+    Returns
+    -------
+    solution : np.ndarray of shape (n_facilities,)
+        Number of ambulances located at each facility.
+    
+    model : gp.Model
+        Gurobi model.
+    """
+    n_facilities = coef.shape[0] // facility_capacity
+
+    model = gp.Model()
+    model.Params.LogToConsole = verbose
+    if time_limit is not None:
+        model.Params.TimeLimit = time_limit
+    x = model.addMVar((n_facilities, facility_capacity), vtype=GRB.BINARY)
+    y = model.addMVar(1, lb=-GRB.INFINITY, ub=GRB.INFINITY, vtype=GRB.CONTINUOUS)
+    model.setObjective(y, optimization_sense)
+    model.addConstr(x.sum() <= n_ambulances)
+    model.addConstr(y == coef@x.reshape(-1) + intercept)
+    model.addConstrs((x[j, k] <= x[j, k-1] for j in range(n_facilities) for k in range(1, facility_capacity)))
+    model.optimize()
+    
+    solution = np.rint(x.X.sum(axis=1)).astype(int)
+    return solution, model
+
+def dt_based_model(
+    n_ambulances: int,
+    optimization_sense: int,
+    dt: DecisionTreeRegressor,
+    facility_capacity: Optional[int] = None,
+    use_gurobi_ml: bool = False,
+    time_limit: Optional[float] = None,
+    verbose: bool = False
+) -> tuple[np.ndarray, gp.Model]:
+    """Solve an ML-based ambulance location model which embeds a decision tree regressor.
+
+    Parameters
+    ----------
+    n_ambulances : int
+        Total number of ambulances.
+    
+    optimization_sense : {GRB.MINIMIZE, GRB.MAXIMIZE}
+        Whether to solve a minimization or maximization problem.
+    
+    dt : DecisionTreeRegressor
+        Decision tree regressor to embed.
+    
+    facility_capacity : int, optional
+        Maximum number of ambulances allowed at any facility.
+    
+    use_gurobi_ml : bool, optional
+        Use the Gurobi Machine Learning package to embed the ML model.
+    
+    time_limit : float, optional
+        Time limit in seconds.
+    
+    verbose : bool, optional
+        Print Gurobi output.
+    
+    Returns
+    -------
+    solution : np.ndarray of shape (n_facilities,)
+        Number of ambulances located at each facility.
+    
+    model : gp.Model
+        Gurobi model.
+    """
+    if facility_capacity is None:
+        facility_capacity = n_ambulances
+    n_facilities = dt.n_features_in_
+
+    model = gp.Model()
+    model.Params.LogToConsole = verbose
+    if time_limit is not None:
+        model.Params.TimeLimit = time_limit
+    x = model.addMVar(n_facilities, lb=0, ub=facility_capacity, vtype=GRB.INTEGER)
+    y = model.addMVar(1, lb=-GRB.INFINITY, ub=GRB.INFINITY, vtype=GRB.CONTINUOUS)
+    model.setObjective(y, optimization_sense)
+    model.addConstr(x.sum() <= n_ambulances)
+    # Because x is integer, we round branching thresholds down to the nearest integer and set epsilon=1
+    branch_nodes = np.where(dt.tree_.children_left > 0)[0]
+    for t in branch_nodes:
+        dt.tree_.threshold[t] = int(dt.tree_.threshold[t])
+    if use_gurobi_ml:
+        add_decision_tree_regressor_constr(model, dt, x, y, epsilon=1)
+    else:
+        embed_decision_tree_regressor(model, dt, x, y, epsilon=1)
+    model.optimize()
+    
+    return np.rint(x.X).astype(int), model
+
 def mlp_based_model(
     n_ambulances: int,
     optimization_sense: int,
@@ -228,11 +360,10 @@ def mlp_based_model(
     biases: list[np.ndarray],
     facility_capacity: Optional[int] = None,
     use_gurobi_ml: bool = False,
-    scale_relu: bool = False,
     time_limit: Optional[float] = None,
     verbose: bool = False
-) -> np.ndarray:
-    """Solve the MLP-based ambulance location model.
+) -> tuple[np.ndarray, gp.Model]:
+    """Solve an ML-based ambulance location model which embeds a multilayer perceptron.
 
     Parameters
     ----------
@@ -243,21 +374,13 @@ def mlp_based_model(
         Whether to solve a minimization or maximization problem.
     
     weights, biases : list[np.ndarray]
-        Weights and biases of the MLP.
+        Weights and biases of the MLP to embed.
     
     facility_capacity : int, optional
         Maximum number of ambulances allowed at any facility.
     
     use_gurobi_ml : bool, optional
-        Use the Gurobi Machine Learning package to embed the MLP.
-    
-    scale_relu : bool, optional
-        How to model the ReLU activation function.
-        - If False, use the original approach seen in most papers.
-        - If True, scale the net inputs to ReLU units so that they are
-        in [-1, 1], then rescale the outputs.
-
-        Ignored if use_gurobi_ml is True.
+        Use the Gurobi Machine Learning package to embed the ML model.
     
     time_limit : float, optional
         Time limit in seconds.
@@ -267,8 +390,11 @@ def mlp_based_model(
     
     Returns
     -------
-    np.ndarray of shape (n_facilities,)
+    solution : np.ndarray of shape (n_facilities,)
         Number of ambulances located at each facility.
+    
+    model : gp.Model
+        Gurobi model.
     """
     if facility_capacity is None:
         facility_capacity = n_ambulances
@@ -279,9 +405,11 @@ def mlp_based_model(
     if time_limit is not None:
         model.Params.TimeLimit = time_limit
     x = model.addMVar(n_facilities, lb=0, ub=facility_capacity, vtype=GRB.INTEGER)
-    y = model.addVar(lb=-GRB.INFINITY, ub=GRB.INFINITY, vtype=GRB.CONTINUOUS)
+    y = model.addMVar(1, lb=-GRB.INFINITY, ub=GRB.INFINITY, vtype=GRB.CONTINUOUS)
     model.setObjective(y, optimization_sense)
+    model.addConstr(x.sum() <= n_ambulances)
     if use_gurobi_ml:
+        # To be compatible with Gurobi ML package, need to convert to a sequential model
         sequential_layers = []
         for weight, bias in zip(weights, biases):
             linear = nn.Linear(weight.shape[1], weight.shape[0])
@@ -293,22 +421,71 @@ def mlp_based_model(
         sequential_model = nn.Sequential(*sequential_layers)
         add_sequential_constr(model, sequential_model, x, y)
     else:
-        M_minus, M_plus = compute_bounds(weights, biases, n_ambulances)
-        embed_mlp(model, weights, biases, x, y, M_minus, M_plus, scale_relu)
-    model.addConstr(x.sum() <= n_ambulances)
+        M_minus, M_plus = compute_mlp_bounds(weights, biases, n_ambulances, facility_capacity)
+        embed_multilayer_perceptron(model, weights, biases, x, y, M_minus, M_plus)
     model.optimize()
     
-    return np.rint(x.X).astype(int)
+    return np.rint(x.X).astype(int), model
 
-def embed_mlp(
+def embed_decision_tree_regressor(
+    gurobi_model: gp.Model,
+    dt: DecisionTreeRegressor,
+    input_vars: gp.MVar,
+    output_vars: gp.MVar,
+    epsilon: float = 0.01
+):
+    """Embed a decision tree regressor in a Gurobi model.
+
+    Parameters
+    ----------
+    gurobi_model : gp.Model
+        Gurobi model.
+    
+    dt : DecisionTreeRegressor
+        Decision tree regressor.
+    
+    input_vars : gp.MVar
+        Decision variables used as input to the decision tree regressor.
+
+        Ensure LB and UB are finite as big-M constraints depend on these bounds.
+    
+    output_vars : gp.MVar
+        Decision variables used as output from the decision tree regressor.
+    
+    epsilon : float, optional
+        Positive constant to model strict inequalities.
+    """
+    # Update needed before accessing variable attributes
+    gurobi_model.update()
+    lb = input_vars.lb
+    ub = input_vars.ub
+    if not (np.isfinite(lb).all() and np.isfinite(ub).all()):
+        raise ValueError("Bounds must be finite")
+    branch_nodes = np.where(dt.tree_.children_left > 0)[0]
+    leaf_nodes = np.where(dt.tree_.children_left < 0)[0]
+    left_child = dt.tree_.children_left
+    right_child = dt.tree_.children_right
+    j = dt.tree_.feature
+    threshold = dt.tree_.threshold
+    value = dt.tree_.value[:, :, 0]
+
+    w = gurobi_model.addMVar(dt.tree_.node_count, lb=0.0, ub=1.0)
+    w[leaf_nodes[1:]].vtype = GRB.BINARY
+    
+    w[0].lb = 1
+    gurobi_model.addConstrs((w[t] == w[left_child[t]] + w[right_child[t]] for t in branch_nodes))
+    gurobi_model.addConstrs((input_vars[j[t]] <= ub[j[t]] - (ub[j[t]] - threshold[t])*w[left_child[t]] for t in branch_nodes))
+    gurobi_model.addConstrs((input_vars[j[t]] >= lb[j[t]] - (lb[j[t]] - (threshold[t] + epsilon))*w[right_child[t]] for t in branch_nodes))
+    gurobi_model.addConstr(output_vars == gp.quicksum(value[t]*w[t] for t in leaf_nodes))
+
+def embed_multilayer_perceptron(
     gurobi_model: gp.Model,
     weights: list[np.ndarray],
     biases: list[np.ndarray],
     input_vars: gp.MVar,
     output_vars: gp.MVar,
     M_minus: list[np.ndarray],
-    M_plus: list[np.ndarray],
-    scale_relu: bool = False
+    M_plus: list[np.ndarray]
 ):
     """Embed an MLP in a Gurobi model.
 
@@ -334,11 +511,6 @@ def embed_mlp(
     
     M_plus : list[np.ndarray]
         Upper bounds for the net input to each hidden unit.
-    
-    scale_relu : bool, optional
-        How to model the ReLU function for the hidden layers.
-        - If False, use the original approach seen in other papers.
-        - If True, scale the net inputs to ReLU units so that they are in [-1, 1], then rescale the outputs.
     """
     n_layers = len(weights)
     layer_dims = [weights[0].shape[1]] + [weight.shape[0] for weight in weights]
@@ -356,22 +528,9 @@ def embed_mlp(
     gurobi_model.addConstr(h[0] == input_vars)
     gurobi_model.addConstr(output_vars == z[-1])
     gurobi_model.addConstrs((z[ell] == weights[ell]@h[ell-1] + biases[ell] for ell in range(1, n_layers+1)))
-
-    if scale_relu:
-        M = [None] + [np.maximum(M_plus[ell], -M_minus[ell]) for ell in range(1, n_layers)]
-
-        z_hat = [None] + [gurobi_model.addMVar(dim, lb=-1.0, ub=1.0, vtype=GRB.CONTINUOUS) for dim in layer_dims[1:-1]]
-        h_hat = [None] + [gurobi_model.addMVar(dim, lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS) for dim in layer_dims[1:-1]]
-
-        gurobi_model.addConstrs((h_hat[ell] <= a[ell] for ell in range(1, n_layers)))
-        gurobi_model.addConstrs((h_hat[ell] >= z_hat[ell] for ell in range(1, n_layers)))
-        gurobi_model.addConstrs((h_hat[ell] <= z_hat[ell] + (1 - a[ell]) for ell in range(1, n_layers)))
-        gurobi_model.addConstrs((z_hat[ell] == z[ell]/M[ell] for ell in range(1, n_layers)))
-        gurobi_model.addConstrs((h[ell] == M[ell]*h_hat[ell] for ell in range(1, n_layers)))
-    else:
-        gurobi_model.addConstrs((h[ell] <= M_plus[ell]*a[ell] for ell in range(1, n_layers)))
-        gurobi_model.addConstrs((h[ell] >= z[ell] for ell in range(1, n_layers)))
-        gurobi_model.addConstrs((h[ell] <= z[ell] - M_minus[ell]*(1 - a[ell]) for ell in range(1, n_layers)))
+    gurobi_model.addConstrs((h[ell] <= M_plus[ell]*a[ell] for ell in range(1, n_layers)))
+    gurobi_model.addConstrs((h[ell] >= z[ell] for ell in range(1, n_layers)))
+    gurobi_model.addConstrs((h[ell] <= z[ell] - M_minus[ell]*(1 - a[ell]) for ell in range(1, n_layers)))
 
     # If lower and upper bounds have the same sign, can fix variables
     for ell in range(1, n_layers):
@@ -383,7 +542,7 @@ def embed_mlp(
         gurobi_model.addConstr(a[ell][inactive_units] == 0)
         gurobi_model.addConstr(h[ell][inactive_units] == 0)
 
-def compute_bounds(
+def compute_mlp_bounds(
     weights: list[np.ndarray],
     biases: list[np.ndarray],
     n_ambulances: int,

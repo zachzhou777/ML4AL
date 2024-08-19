@@ -8,6 +8,8 @@ import pandas as pd
 from gurobipy import GRB
 from ems_data import *
 from simulation import *
+from dataset import *
+from linear_model import *
 from neural_network import *
 from mip_models import *
 
@@ -33,20 +35,10 @@ SERVICE_RATE = {
     5: {20: 21.448296831622255, 25: 21.869929046629107, 30: 21.966665014684228}
 }
 
-def best_solution_from_dataset(dataset: pd.DataFrame, n_ambulances: int, metric: str) -> tuple[pd.Series, pd.Series]:
-    """Finds the best solution w.r.t. a metric for a given maximum number of ambulances."""
-    X = dataset.drop(columns=METRICS)
-    Y = dataset[METRICS]
-    indices = np.where(X.sum(axis=1) <= n_ambulances)[0]
-    argmin_or_argmax = np.argmin if 'response_time' in metric else np.argmax
-    y = Y[metric]
-    best_idx = indices[argmin_or_argmax(y[indices])]
-    return X.iloc[best_idx], Y.iloc[best_idx]
-
 if __name__ == '__main__':
     with open(RESULTS_FILE, mode='w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['instance', 'model_name', 'runtime', 'solution', *METRICS])
+        writer.writerow(['instance', 'model_name', 'solution', 'total_runtime', 'gurobi_runtime', 'mipgap', 'objval', 'objbound', *METRICS])
     
     with open('ems_data.pkl', 'rb') as f:
         ems_data = pickle.load(f)
@@ -74,7 +66,7 @@ if __name__ == '__main__':
             for metric in [coverage_metric, 'survival_rate', 'response_time_mean']:
                 solution, results = best_solution_from_dataset(dataset, n_ambulances, metric)
                 rows.append(
-                    [instance, f'best_{metric}', None, solution.tolist()]
+                    [instance, f'Best-{metric}', solution.tolist(), None, None, None, None, None]
                     + [results[metric] for metric in METRICS]
                 )
             with open(RESULTS_FILE, mode='a', newline='') as f:
@@ -83,7 +75,7 @@ if __name__ == '__main__':
             
             # MEXCLP
             start = time.perf_counter()
-            solution = mexclp(
+            solution, model = mexclp(
                 n_ambulances=n_ambulances,
                 distance=distance,
                 threshold=threshold,
@@ -92,19 +84,19 @@ if __name__ == '__main__':
                 time_limit=TIME_LIMIT,
                 verbose=False
             )
-            runtime = time.perf_counter() - start
+            total_runtime = time.perf_counter() - start
             results = sim.run(solution).mean()
             row = (
-                [instance, 'MEXCLP', runtime, solution.tolist()]
+                [instance, 'MEXCLP', solution.tolist(), total_runtime, model.Runtime, model.MIPGap, model.ObjVal, model.ObjBound]
                 + [results[metric] for metric in METRICS]
             )
             with open(RESULTS_FILE, mode='a', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(row)
             
-            # p-Median with queueing model
+            # p-Median with queueing
             start = time.perf_counter()
-            solution = pmedian_with_queuing(
+            solution, model = pmedian_with_queueing(
                 n_ambulances=n_ambulances,
                 distance=distance,
                 arrival_rate=ems_data.avg_calls_per_day,
@@ -114,10 +106,145 @@ if __name__ == '__main__':
                 time_limit=TIME_LIMIT,
                 verbose=False
             )
-            runtime = time.perf_counter() - start
+            total_runtime = time.perf_counter() - start
             results = sim.run(solution).mean()
             row = (
-                [instance, 'p-Median + Queueing', runtime, solution.tolist()]
+                [instance, 'pMQ', solution.tolist(), total_runtime, model.Runtime, model.MIPGap, model.ObjVal, model.ObjBound]
+                + [results[metric] for metric in METRICS]
+            )
+            with open(RESULTS_FILE, mode='a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(row)
+            
+            # Linear-Coverage
+            with open(f'trained_ml_models/{REGION_ID_TO_NAME[region_id].lower()}_coverage_linear.pkl', 'rb') as f:
+                ridge = pickle.load(f)
+            start = time.perf_counter()
+            solution, model = linear_based_model(
+                n_ambulances=n_ambulances,
+                optimization_sense=GRB.MAXIMIZE,
+                coef=keep_relevant_coefficients(ridge.coef_, n_stations, FACILITY_CAPACITY),
+                intercept=ridge.intercept_,
+                facility_capacity=FACILITY_CAPACITY,
+                time_limit=TIME_LIMIT,
+                verbose=False
+            )
+            total_runtime = time.perf_counter() - start
+            results = sim.run(solution).mean()
+            row = (
+                [instance, 'Linear-Coverage', solution.tolist(), total_runtime, model.Runtime, model.MIPGap, model.ObjVal, model.ObjBound]
+                + [results[metric] for metric in METRICS]
+            )
+            with open(RESULTS_FILE, mode='a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(row)
+            
+            # Linear-Survival
+            with open(f'trained_ml_models/{REGION_ID_TO_NAME[region_id].lower()}_survival_linear.pkl', 'rb') as f:
+                ridge = pickle.load(f)
+            start = time.perf_counter()
+            solution, model = linear_based_model(
+                n_ambulances=n_ambulances,
+                optimization_sense=GRB.MAXIMIZE,
+                coef=keep_relevant_coefficients(ridge.coef_, n_stations, FACILITY_CAPACITY),
+                intercept=ridge.intercept_,
+                facility_capacity=FACILITY_CAPACITY,
+                time_limit=TIME_LIMIT,
+                verbose=False
+            )
+            total_runtime = time.perf_counter() - start
+            results = sim.run(solution).mean()
+            row = (
+                [instance, 'Linear-Survival', solution.tolist(), total_runtime, model.Runtime, model.MIPGap, model.ObjVal, model.ObjBound]
+                + [results[metric] for metric in METRICS]
+            )
+            with open(RESULTS_FILE, mode='a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(row)
+            
+            # Linear-Median
+            with open(f'trained_ml_models/{REGION_ID_TO_NAME[region_id].lower()}_median_linear.pkl', 'rb') as f:
+                ridge = pickle.load(f)
+            start = time.perf_counter()
+            solution, model = linear_based_model(
+                n_ambulances=n_ambulances,
+                optimization_sense=GRB.MINIMIZE,
+                coef=keep_relevant_coefficients(ridge.coef_, n_stations, FACILITY_CAPACITY),
+                intercept=ridge.intercept_,
+                facility_capacity=FACILITY_CAPACITY,
+                time_limit=TIME_LIMIT,
+                verbose=False
+            )
+            total_runtime = time.perf_counter() - start
+            results = sim.run(solution).mean()
+            row = (
+                [instance, 'Linear-Median', solution.tolist(), total_runtime, model.Runtime, model.MIPGap, model.ObjVal, model.ObjBound]
+                + [results[metric] for metric in METRICS]
+            )
+            with open(RESULTS_FILE, mode='a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(row)
+            
+            # DT-Coverage
+            with open(f'trained_ml_models/{REGION_ID_TO_NAME[region_id].lower()}_coverage_dt.pkl', 'rb') as f:
+                dt = pickle.load(f)
+            start = time.perf_counter()
+            solution, model = dt_based_model(
+                n_ambulances=n_ambulances,
+                optimization_sense=GRB.MAXIMIZE,
+                dt=dt,
+                facility_capacity=FACILITY_CAPACITY,
+                time_limit=TIME_LIMIT,
+                verbose=False
+            )
+            total_runtime = time.perf_counter() - start
+            results = sim.run(solution).mean()
+            row = (
+                [instance, 'DT-Coverage', solution.tolist(), total_runtime, model.Runtime, model.MIPGap, model.ObjVal, model.ObjBound]
+                + [results[metric] for metric in METRICS]
+            )
+            with open(RESULTS_FILE, mode='a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(row)
+            
+            # DT-Survival
+            with open(f'trained_ml_models/{REGION_ID_TO_NAME[region_id].lower()}_survival_dt.pkl', 'rb') as f:
+                dt = pickle.load(f)
+            start = time.perf_counter()
+            solution, model = dt_based_model(
+                n_ambulances=n_ambulances,
+                optimization_sense=GRB.MAXIMIZE,
+                dt=dt,
+                facility_capacity=FACILITY_CAPACITY,
+                time_limit=TIME_LIMIT,
+                verbose=False
+            )
+            total_runtime = time.perf_counter() - start
+            results = sim.run(solution).mean()
+            row = (
+                [instance, 'DT-Survival', solution.tolist(), total_runtime, model.Runtime, model.MIPGap, model.ObjVal, model.ObjBound]
+                + [results[metric] for metric in METRICS]
+            )
+            with open(RESULTS_FILE, mode='a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(row)
+            
+            # DT-Median
+            with open(f'trained_ml_models/{REGION_ID_TO_NAME[region_id].lower()}_median_dt.pkl', 'rb') as f:
+                dt = pickle.load(f)
+            start = time.perf_counter()
+            solution, model = dt_based_model(
+                n_ambulances=n_ambulances,
+                optimization_sense=GRB.MINIMIZE,
+                dt=dt,
+                facility_capacity=FACILITY_CAPACITY,
+                time_limit=TIME_LIMIT,
+                verbose=False
+            )
+            total_runtime = time.perf_counter() - start
+            results = sim.run(solution).mean()
+            row = (
+                [instance, 'DT-Median', solution.tolist(), total_runtime, model.Runtime, model.MIPGap, model.ObjVal, model.ObjBound]
                 + [results[metric] for metric in METRICS]
             )
             with open(RESULTS_FILE, mode='a', newline='') as f:
@@ -125,9 +252,9 @@ if __name__ == '__main__':
                 writer.writerow(row)
 
             # MLP-Coverage
-            weights, biases = MLP.load_npz(f'{REGION_ID_TO_NAME[region_id].lower()}_coverage.npz')
+            weights, biases = MLP.load_npz(f'trained_ml_models/{REGION_ID_TO_NAME[region_id].lower()}_coverage.npz')
             start = time.perf_counter()
-            solution = mlp_based_model(
+            solution, model = mlp_based_model(
                 n_ambulances=n_ambulances,
                 optimization_sense=GRB.MAXIMIZE,
                 weights=weights,
@@ -136,10 +263,10 @@ if __name__ == '__main__':
                 time_limit=TIME_LIMIT,
                 verbose=False
             )
-            runtime = time.perf_counter() - start
+            total_runtime = time.perf_counter() - start
             results = sim.run(solution).mean()
             row = (
-                [instance, 'MLP-Coverage', runtime, solution.tolist()]
+                [instance, 'MLP-Coverage', solution.tolist(), total_runtime, model.Runtime, model.MIPGap, model.ObjVal, model.ObjBound]
                 + [results[metric] for metric in METRICS]
             )
             with open(RESULTS_FILE, mode='a', newline='') as f:
@@ -147,9 +274,9 @@ if __name__ == '__main__':
                 writer.writerow(row)
 
             # MLP-Survival
-            weights, biases = MLP.load_npz(f'{REGION_ID_TO_NAME[region_id].lower()}_survival.npz')
+            weights, biases = MLP.load_npz(f'trained_ml_models/{REGION_ID_TO_NAME[region_id].lower()}_survival.npz')
             start = time.perf_counter()
-            solution = mlp_based_model(
+            solution, model = mlp_based_model(
                 n_ambulances=n_ambulances,
                 optimization_sense=GRB.MAXIMIZE,
                 weights=weights,
@@ -158,20 +285,20 @@ if __name__ == '__main__':
                 time_limit=TIME_LIMIT,
                 verbose=False
             )
-            runtime = time.perf_counter() - start
+            total_runtime = time.perf_counter() - start
             results = sim.run(solution).mean()
             row = (
-                [instance, 'MLP-Survival', runtime, solution.tolist()]
+                [instance, 'MLP-Survival', solution.tolist(), total_runtime, model.Runtime, model.MIPGap, model.ObjVal, model.ObjBound]
                 + [results[metric] for metric in METRICS]
             )
             with open(RESULTS_FILE, mode='a', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(row)
 
-            # MLP-pMedian
-            weights, biases = MLP.load_npz(f'{REGION_ID_TO_NAME[region_id].lower()}_pmedian.npz')
+            # MLP-Median
+            weights, biases = MLP.load_npz(f'trained_ml_models/{REGION_ID_TO_NAME[region_id].lower()}_median.npz')
             start = time.perf_counter()
-            solution = mlp_based_model(
+            solution, model = mlp_based_model(
                 n_ambulances=n_ambulances,
                 optimization_sense=GRB.MINIMIZE,
                 weights=weights,
@@ -180,10 +307,10 @@ if __name__ == '__main__':
                 time_limit=TIME_LIMIT,
                 verbose=False
             )
-            runtime = time.perf_counter() - start
+            total_runtime = time.perf_counter() - start
             results = sim.run(solution).mean()
             row = (
-                [instance, 'MLP-pMedian', runtime, solution.tolist()]
+                [instance, 'MLP-Median', solution.tolist(), total_runtime, model.Runtime, model.MIPGap, model.ObjVal, model.ObjBound]
                 + [results[metric] for metric in METRICS]
             )
             with open(RESULTS_FILE, mode='a', newline='') as f:
