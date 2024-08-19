@@ -4,3 +4,4 @@ __pycache__/
 data/
 test*
 sim*/
+!trained_ml_models/*.pkl
