@@ -3,7 +3,6 @@
 import csv
 import pickle
 import time
-import numpy as np
 import pandas as pd
 from gurobipy import GRB
 from ems_data import *
