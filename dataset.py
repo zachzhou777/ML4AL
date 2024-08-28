@@ -1,4 +1,4 @@
-"""Functions for working with the datasets. Mostly for preprocessing."""
+"""Miscellaneous functions for working with the datasets."""
 import numpy as np
 import pandas as pd
 from simulation import *

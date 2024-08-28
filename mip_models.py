@@ -1,15 +1,16 @@
 import math
-from typing import Optional
+from typing import Optional, Any
 import numpy as np
-import pandas as pd
 from scipy import optimize
 import torch
 import torch.nn as nn
 from sklearn.tree import DecisionTreeRegressor
+import lightgbm as lgb
 import gurobipy as gp
 from gurobipy import GRB
-from gurobi_ml.torch import add_sequential_constr
 from gurobi_ml.sklearn import add_decision_tree_regressor_constr
+from gurobi_ml.lightgbm import add_lgbm_booster_constr
+from gurobi_ml.torch import add_sequential_constr
 
 # Precomputed distances (km) such that response time at most 9 or 15 minutes with probability 90%
 MEXCLP_THRESHOLD_9MIN = 3.64
@@ -341,14 +342,77 @@ def dt_based_model(
     y = model.addMVar(1, lb=-GRB.INFINITY, ub=GRB.INFINITY, vtype=GRB.CONTINUOUS)
     model.setObjective(y, optimization_sense)
     model.addConstr(x.sum() <= n_ambulances)
-    # Because x is integer, we round branching thresholds down to the nearest integer and set epsilon=1
-    branch_nodes = np.where(dt.tree_.children_left > 0)[0]
-    for t in branch_nodes:
-        dt.tree_.threshold[t] = int(dt.tree_.threshold[t])
     if use_gurobi_ml:
+        # Gurobi ML does not automatically round thresholds down and set epsilon to 1 for integer input_vars
+        branch_nodes = (dt.tree_.children_left > 0).nonzero()[0]
+        old_thresholds = dt.tree_.threshold[branch_nodes]
+        dt.tree_.threshold[branch_nodes] = np.floor(old_thresholds)
         add_decision_tree_regressor_constr(model, dt, x, y, epsilon=1)
+        dt.tree_.threshold[branch_nodes] = old_thresholds
     else:
-        embed_decision_tree_regressor(model, dt, x, y, epsilon=1)
+        embed_decision_tree(model, dt, x, y)
+    model.optimize()
+    
+    return np.rint(x.X).astype(int), model
+
+def gbm_based_model(
+    n_ambulances: int,
+    optimization_sense: int,
+    gbm: lgb.Booster,
+    facility_capacity: Optional[int] = None,
+    use_gurobi_ml: bool = False,
+    time_limit: Optional[float] = None,
+    verbose: bool = False
+) -> tuple[np.ndarray, gp.Model]:
+    """Solve an ML-based ambulance location model which embeds a LightGBM model.
+
+    Parameters
+    ----------
+    n_ambulances : int
+        Total number of ambulances.
+    
+    optimization_sense : {GRB.MINIMIZE, GRB.MAXIMIZE}
+        Whether to solve a minimization or maximization problem.
+    
+    gbm : lgb.Booster
+        LightGBM model to embed.
+    
+    facility_capacity : int, optional
+        Maximum number of ambulances allowed at any facility.
+    
+    use_gurobi_ml : bool, optional
+        Use the Gurobi Machine Learning package to embed the ML model.
+    
+    time_limit : float, optional
+        Time limit in seconds.
+    
+    verbose : bool, optional
+        Print Gurobi output.
+    
+    Returns
+    -------
+    solution : np.ndarray of shape (n_facilities,)
+        Number of ambulances located at each facility.
+    
+    model : gp.Model
+        Gurobi model.
+    """
+    if facility_capacity is None:
+        facility_capacity = n_ambulances
+    n_facilities = gbm.num_feature()
+
+    model = gp.Model()
+    model.Params.LogToConsole = verbose
+    if time_limit is not None:
+        model.Params.TimeLimit = time_limit
+    x = model.addMVar(n_facilities, lb=0, ub=facility_capacity, vtype=GRB.INTEGER)
+    y = model.addMVar(1, lb=-GRB.INFINITY, ub=GRB.INFINITY, vtype=GRB.CONTINUOUS)
+    model.setObjective(y, optimization_sense)
+    model.addConstr(x.sum() <= n_ambulances)
+    if use_gurobi_ml:
+        add_lgbm_booster_constr(model, gbm, x, y)
+    else:
+        embed_lightgbm_model(model, gbm, x, y)
     model.optimize()
     
     return np.rint(x.X).astype(int), model
@@ -427,9 +491,9 @@ def mlp_based_model(
     
     return np.rint(x.X).astype(int), model
 
-def embed_decision_tree_regressor(
+def embed_decision_tree(
     gurobi_model: gp.Model,
-    dt: DecisionTreeRegressor,
+    decision_tree: DecisionTreeRegressor | dict[str, np.ndarray],
     input_vars: gp.MVar,
     output_vars: gp.MVar,
     epsilon: float = 0.01
@@ -441,19 +505,26 @@ def embed_decision_tree_regressor(
     gurobi_model : gp.Model
         Gurobi model.
     
-    dt : DecisionTreeRegressor
-        Decision tree regressor.
-    
-    input_vars : gp.MVar
+    decision_tree : DecisionTreeRegressor | dict[str, np.ndarray]
+        Decision tree.
+
+        If a dictionary, must contain the following key-value pairs:
+        - 'children_left': np.ndarray of shape (n_nodes,)
+        - 'children_right': np.ndarray of shape (n_nodes,)
+        - 'feature': np.ndarray of shape (n_nodes,)
+        - 'threshold': np.ndarray of shape (n_nodes,)
+        - 'value': np.ndarray of shape (n_nodes,), (n_nodes, n_outputs), or (n_nodes, n_outputs, 1)
+
+    input_vars : gp.MVar of shape (n_features,)
         Decision variables used as input to the decision tree regressor.
 
         Ensure LB and UB are finite as big-M constraints depend on these bounds.
     
-    output_vars : gp.MVar
+    output_vars : gp.MVar of shape (n_outputs,)
         Decision variables used as output from the decision tree regressor.
     
     epsilon : float, optional
-        Positive constant to model strict inequalities.
+        Positive constant to model splits involving continuous features.
     """
     # Update needed before accessing variable attributes
     gurobi_model.update()
@@ -461,22 +532,83 @@ def embed_decision_tree_regressor(
     ub = input_vars.ub
     if not (np.isfinite(lb).all() and np.isfinite(ub).all()):
         raise ValueError("Bounds must be finite")
-    branch_nodes = np.where(dt.tree_.children_left > 0)[0]
-    leaf_nodes = np.where(dt.tree_.children_left < 0)[0]
-    left_child = dt.tree_.children_left
-    right_child = dt.tree_.children_right
-    j = dt.tree_.feature
-    threshold = dt.tree_.threshold
-    value = dt.tree_.value[:, :, 0]
+    if isinstance(decision_tree, DecisionTreeRegressor):
+        tree = decision_tree.tree_
+        children_left = tree.children_left
+        children_right = tree.children_right
+        feature = tree.feature
+        threshold = tree.threshold
+        value = tree.value
+    else:
+        children_left = decision_tree['children_left']
+        children_right = decision_tree['children_right']
+        feature = decision_tree['feature']
+        threshold = decision_tree['threshold']
+        value = decision_tree['value']
+    if value.ndim == 3:
+        value = value[:, :, 0]
+    n_nodes = children_left.shape[0]
+    branch_nodes = (children_left > 0).nonzero()[0]
+    leaf_nodes = (children_left < 0).nonzero()[0]
+    # For branch nodes testing integer features, round thresholds down and set corresponding epsilon to 1
+    tests_integer_feature = np.isin(input_vars.vtype[feature[branch_nodes]], [GRB.BINARY, GRB.INTEGER])
+    threshold = threshold[branch_nodes]
+    threshold = np.where(tests_integer_feature, np.floor(threshold), threshold)
+    epsilon = np.where(tests_integer_feature, 1, epsilon)
 
-    w = gurobi_model.addMVar(dt.tree_.node_count, lb=0.0, ub=1.0)
+    w = gurobi_model.addMVar(n_nodes, lb=0.0, ub=1.0)
     w[leaf_nodes[1:]].vtype = GRB.BINARY
     
     w[0].lb = 1
-    gurobi_model.addConstrs((w[t] == w[left_child[t]] + w[right_child[t]] for t in branch_nodes))
-    gurobi_model.addConstrs((input_vars[j[t]] <= ub[j[t]] - (ub[j[t]] - threshold[t])*w[left_child[t]] for t in branch_nodes))
-    gurobi_model.addConstrs((input_vars[j[t]] >= lb[j[t]] - (lb[j[t]] - (threshold[t] + epsilon))*w[right_child[t]] for t in branch_nodes))
-    gurobi_model.addConstr(output_vars == gp.quicksum(value[t]*w[t] for t in leaf_nodes))
+    gurobi_model.addConstr(
+        w[branch_nodes] == w[children_left[branch_nodes]] + w[children_right[branch_nodes]]
+    )
+    gurobi_model.addConstr(
+        input_vars[feature[branch_nodes]] <= ub[feature[branch_nodes]]
+        - (ub[feature[branch_nodes]] - threshold)*w[children_left[branch_nodes]]
+    )
+    gurobi_model.addConstr(
+        input_vars[feature[branch_nodes]] >= lb[feature[branch_nodes]]
+        + (threshold + epsilon - lb[feature[branch_nodes]])*w[children_right[branch_nodes]]
+    )
+    gurobi_model.addConstr(
+        output_vars == value[leaf_nodes].T@w[leaf_nodes]
+    )
+    # Future work: fix w[t].ub = 0 for unreachable nodes t, or prune dead branches to get a smaller tree
+
+def embed_lightgbm_model(
+    gurobi_model: gp.Model,
+    gbm: lgb.Booster,
+    input_vars: gp.MVar,
+    output_vars: gp.MVar,
+    epsilon: float = 0.01
+):
+    """Embed a LightGBM model in a Gurobi model.
+
+    Parameters
+    ----------
+    gurobi_model : gp.Model
+        Gurobi model.
+    
+    gbm : lgb.Booster
+        LightGBM model.
+    
+    input_vars : gp.MVar of shape (n_features,)
+        Decision variables used as input to the gradient boosting machine.
+    
+    output_var : gp.MVar of shape (1,)
+        Decision variable used as output from the gradient boosting machine.
+    
+    epsilon : float, optional
+        Positive constant to model strict inequalities.
+    """
+    n_trees = gbm.num_trees()
+    y = gurobi_model.addMVar(n_trees, lb=-GRB.INFINITY, ub=GRB.INFINITY, vtype=GRB.CONTINUOUS)
+    for i in range(n_trees):
+        lightgbm_tree = gbm.dump_model()['tree_info'][i]['tree_structure']
+        dt = flatten_lightgbm_tree(lightgbm_tree)
+        embed_decision_tree(gurobi_model, dt, input_vars, y[i], epsilon)
+    gurobi_model.addConstr(output_vars == y.sum())
 
 def embed_multilayer_perceptron(
     gurobi_model: gp.Model,
@@ -500,10 +632,10 @@ def embed_multilayer_perceptron(
     weights, biases : list[np.ndarray]
         Weights and biases of the MLP.
     
-    input_vars : gp.MVar
+    input_vars : gp.MVar of shape (n_features,)
         Decision variables used as input to the MLP.
     
-    output_vars : gp.MVar
+    output_vars : gp.MVar of shape (n_outputs,)
         Decision variables used as output from the MLP.
     
     M_minus : list[np.ndarray]
@@ -607,3 +739,64 @@ def compute_mlp_bounds(
         M_plus.append(M_plus_ell)
     
     return M_minus, M_plus
+
+def flatten_lightgbm_tree(tree: dict[str, Any], dummy_value: int = -1) -> dict[str, np.ndarray]:
+    """Convert a LightGBM tree to a flat representation similar to scikit-learn's.
+
+    Parameters
+    ----------
+    tree : dict[str, Any]
+        A tree structure from a LightGBM model.
+
+        For example, if gbm is an instance of lgb.Booster, then tree i can be accessed as
+        gbm.dump_model()['tree_info'][i]['tree_structure'].
+
+    dummy_value : int, optional
+        Dummy value to pad arrays with, as arrays pertain only to either branch or leaf nodes.
+
+    Returns
+    -------
+    dict[str, np.ndarray]
+        Contains the following arrays:
+        - children_left
+        - children_right
+        - feature
+        - threshold
+        - value
+    """
+    children_left = []
+    children_right = []
+    feature = []
+    threshold = []
+    value = []
+    
+    def recurse(subtree: dict[str, Any]) -> int:
+        current_node_index = len(feature)
+        if 'split_index' in subtree:
+            if subtree['decision_type'] != '<=':
+                raise ValueError(f"'decision_type' was {subtree['decision_type']}, expected '<='")
+            feature.append(subtree['split_feature'])
+            threshold.append(subtree['threshold'])
+            value.append(dummy_value)
+            # Have to append dummy values to overwrite later because of recursion
+            children_left.append(0)
+            children_right.append(0)
+            children_left[current_node_index] = recurse(subtree['left_child'])
+            children_right[current_node_index] = recurse(subtree['right_child'])
+        else:
+            children_left.append(dummy_value)
+            children_right.append(dummy_value)
+            feature.append(dummy_value)
+            threshold.append(dummy_value)
+            value.append(subtree['leaf_value'])
+        return current_node_index
+    
+    recurse(tree)
+    
+    return {
+        'children_left': np.array(children_left),
+        'children_right': np.array(children_right),
+        'feature': np.array(feature),
+        'threshold': np.array(threshold),
+        'value': np.array(value)
+    }

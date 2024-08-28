@@ -249,7 +249,73 @@ if __name__ == '__main__':
             with open(RESULTS_FILE, mode='a', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(row)
-
+            
+            # GBM-Coverage
+            with open(f'trained_ml_models/{REGION_ID_TO_NAME[region_id].lower()}_coverage_gbm.pkl', 'rb') as f:
+                gbm = pickle.load(f)
+            start = time.perf_counter()
+            solution, model = gbm_based_model(
+                n_ambulances=n_ambulances,
+                optimization_sense=GRB.MAXIMIZE,
+                gbm=gbm,
+                facility_capacity=FACILITY_CAPACITY,
+                time_limit=TIME_LIMIT,
+                verbose=False
+            )
+            total_runtime = time.perf_counter() - start
+            results = sim.run(solution).mean()
+            row = (
+                [instance, 'GBM-Coverage', solution.tolist(), total_runtime, model.Runtime, model.MIPGap, model.ObjVal, model.ObjBound]
+                + [results[metric] for metric in METRICS]
+            )
+            with open(RESULTS_FILE, mode='a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(row)
+            
+            # GBM-Survival
+            with open(f'trained_ml_models/{REGION_ID_TO_NAME[region_id].lower()}_survival_gbm.pkl', 'rb') as f:
+                gbm = pickle.load(f)
+            start = time.perf_counter()
+            solution, model = gbm_based_model(
+                n_ambulances=n_ambulances,
+                optimization_sense=GRB.MAXIMIZE,
+                gbm=gbm,
+                facility_capacity=FACILITY_CAPACITY,
+                time_limit=TIME_LIMIT,
+                verbose=False
+            )
+            total_runtime = time.perf_counter() - start
+            results = sim.run(solution).mean()
+            row = (
+                [instance, 'GBM-Survival', solution.tolist(), total_runtime, model.Runtime, model.MIPGap, model.ObjVal, model.ObjBound]
+                + [results[metric] for metric in METRICS]
+            )
+            with open(RESULTS_FILE, mode='a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(row)
+            
+            # GBM-Median
+            with open(f'trained_ml_models/{REGION_ID_TO_NAME[region_id].lower()}_median_gbm.pkl', 'rb') as f:
+                gbm = pickle.load(f)
+            start = time.perf_counter()
+            solution, model = gbm_based_model(
+                n_ambulances=n_ambulances,
+                optimization_sense=GRB.MINIMIZE,
+                gbm=gbm,
+                facility_capacity=FACILITY_CAPACITY,
+                time_limit=TIME_LIMIT,
+                verbose=False
+            )
+            total_runtime = time.perf_counter() - start
+            results = sim.run(solution).mean()
+            row = (
+                [instance, 'GBM-Median', solution.tolist(), total_runtime, model.Runtime, model.MIPGap, model.ObjVal, model.ObjBound]
+                + [results[metric] for metric in METRICS]
+            )
+            with open(RESULTS_FILE, mode='a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(row)
+            
             # MLP-Coverage
             weights, biases = MLP.load_npz(f'trained_ml_models/{REGION_ID_TO_NAME[region_id].lower()}_coverage.npz')
             start = time.perf_counter()
